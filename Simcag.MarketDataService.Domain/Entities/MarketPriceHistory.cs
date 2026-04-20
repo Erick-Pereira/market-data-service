@@ -1,37 +1,24 @@
 namespace Simcag.MarketDataService.Domain.Entities;
 
-public class MarketPrice
+public class MarketPriceHistory
 {
     public Guid Id { get; private set; }
     public string ProductName { get; private set; } = string.Empty;
     public decimal Price { get; private set; }
     public string Source { get; private set; } = string.Empty;
     public DateTime CollectedDate { get; private set; }
-    public bool IsActive { get; private set; }
 
-    private MarketPrice() { }
+    private MarketPriceHistory() { }
 
-    public static MarketPrice Create(string productName, decimal price, string source)
+    public static MarketPriceHistory Create(string productName, decimal price, string source, DateTime collectedDate)
     {
-        return new MarketPrice
+        return new MarketPriceHistory
         {
             Id = Guid.NewGuid(),
             ProductName = productName,
             Price = price,
             Source = source,
-            CollectedDate = DateTime.UtcNow,
-            IsActive = true
+            CollectedDate = collectedDate
         };
-    }
-
-    public void UpdatePrice(decimal newPrice)
-    {
-        Price = newPrice;
-        CollectedDate = DateTime.UtcNow;
-    }
-
-    public void Deactivate()
-    {
-        IsActive = false;
     }
 }
