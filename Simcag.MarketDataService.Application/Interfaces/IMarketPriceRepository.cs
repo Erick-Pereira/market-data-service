@@ -10,6 +10,11 @@ public interface IMarketPriceRepository
     Task AddAsync(MarketPrice marketPrice, CancellationToken ct);
     Task UpdateAsync(MarketPrice marketPrice, CancellationToken ct);
     Task<IEnumerable<MarketPrice>> GetAllAsync(CancellationToken ct);
+
+    Task<IReadOnlyList<MarketPrice>> GetActiveByCategoryAndRegionAsync(
+        string expenseCategory,
+        string geographicRegion,
+        CancellationToken ct);
 }
 
 public interface IMarketPriceHistoryRepository

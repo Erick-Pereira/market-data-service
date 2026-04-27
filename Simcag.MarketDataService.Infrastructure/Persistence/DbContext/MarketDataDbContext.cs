@@ -37,8 +37,21 @@ public class MarketDataDbContext : Microsoft.EntityFrameworkCore.DbContext
             entity.Property(e => e.IsActive)
                 .IsRequired();
 
+            entity.Property(e => e.ExpenseCategory)
+                .IsRequired()
+                .HasMaxLength(120);
+
+            entity.Property(e => e.GeographicRegion)
+                .IsRequired()
+                .HasMaxLength(64);
+
+            entity.Property(e => e.SupplierProfile)
+                .IsRequired()
+                .HasMaxLength(120);
+
             entity.HasIndex(e => e.ProductName);
             entity.HasIndex(e => new { e.ProductName, e.IsActive });
+            entity.HasIndex(e => new { e.ExpenseCategory, e.GeographicRegion, e.IsActive });
         });
 
         modelBuilder.Entity<MarketPriceHistory>(entity =>

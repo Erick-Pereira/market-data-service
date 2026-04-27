@@ -1,5 +1,5 @@
 <Solution>
-  <Project Path="market-data-service/market-data-service.csproj" />
+  <Project Path="Simcag.MarketDataService.Api/market-data-service.csproj" />
   <Project Path="Simcag.MarketDataService.Application/Simcag.MarketDataService.Application.csproj" Id="8de55828-d70a-4743-9516-cbda9e2ba28f" />
   <Project Path="Simcag.MarketDataService.Domain/Simcag.MarketDataService.Domain.csproj" Id="06bb4cb2-ba13-4c2b-a4ce-4251f4d2dfef" />
   <Project Path="Simcag.MarketDataService.Infrastructure/Simcag.MarketDataService.Infrastructure.csproj" Id="fd51d369-c64c-4ead-82ee-1b3471b27329" />

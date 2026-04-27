@@ -1,15 +1,17 @@
-using StackExchange.Redis;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using Simcag.MarketDataService.Application.Cache;
+using Simcag.MarketDataService.Application.DTOs;
 using Simcag.MarketDataService.Application.Interfaces;
 using Simcag.MarketDataService.Domain.Entities;
-using Microsoft.Extensions.Logging;
-using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
+using StackExchange.Redis;
 
 namespace Simcag.MarketDataService.Application.Services;
 
 public class MarketDataCacheService : IMarketDataCacheService
 {
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
     private readonly IDatabase _redisDb;
     private readonly ILogger<MarketDataCacheService> _logger;
     private readonly TimeSpan _defaultTtl = TimeSpan.FromHours(1);
@@ -26,18 +28,22 @@ public class MarketDataCacheService : IMarketDataCacheService
     {
         try
         {
-            var key = GetCacheKey(productName);
+            var key = GetProductCacheKey(productName);
             var cachedValue = await _redisDb.StringGetAsync(key);
 
-            if (!cachedValue.IsNullOrEmpty)
+            if (cachedValue.IsNullOrEmpty)
             {
-                var marketPrice = JsonSerializer.Deserialize<MarketPrice>((string)cachedValue!);
-                _logger.LogInformation("Cache hit for product {ProductName}: {Price:C}", productName, marketPrice?.Price);
-                return marketPrice;
+                _logger.LogInformation("Cache miss for product {ProductName}", productName);
+                return null;
             }
 
-            _logger.LogInformation("Cache miss for product {ProductName}", productName);
-            return null;
+            var entry = JsonSerializer.Deserialize<MarketPriceCacheEntry>((string)cachedValue!, JsonOptions);
+            if (entry == null)
+                return null;
+
+            var marketPrice = MarketPrice.FromCachedQuote(entry.ProductName, entry.Price, entry.Source, entry.CollectedDate);
+            _logger.LogInformation("Cache hit for product {ProductName}: {Price:C}", productName, entry.Price);
+            return marketPrice;
         }
         catch (Exception ex)
         {
@@ -50,9 +56,15 @@ public class MarketDataCacheService : IMarketDataCacheService
     {
         try
         {
-            var key = GetCacheKey(marketPrice.ProductName);
-            var serializedValue = JsonSerializer.Serialize(marketPrice);
-
+            var key = GetProductCacheKey(marketPrice.ProductName);
+            var entry = new MarketPriceCacheEntry
+            {
+                ProductName = marketPrice.ProductName,
+                Price = marketPrice.Price,
+                Source = marketPrice.Source,
+                CollectedDate = marketPrice.CollectedDate
+            };
+            var serializedValue = JsonSerializer.Serialize(entry, JsonOptions);
             var success = await _redisDb.StringSetAsync(key, serializedValue, _defaultTtl);
 
             if (success)
@@ -75,13 +87,11 @@ public class MarketDataCacheService : IMarketDataCacheService
     {
         try
         {
-            var key = GetCacheKey(productName);
+            var key = GetProductCacheKey(productName);
             var success = await _redisDb.KeyDeleteAsync(key);
 
             if (success)
-            {
                 _logger.LogInformation("Removed cache entry for product {ProductName}", productName);
-            }
         }
         catch (Exception ex)
         {
@@ -108,9 +118,41 @@ public class MarketDataCacheService : IMarketDataCacheService
         }
     }
 
-    private string GetCacheKey(string productName)
+    public async Task<MarketDataResponseDto?> GetBenchmarkAsync(string category, string region, CancellationToken ct)
     {
-        // Normalize product name for consistent caching
-        return $"marketprice:{productName.ToLower().Trim()}";
+        try
+        {
+            var key = GetBenchmarkCacheKey(category, region);
+            var cachedValue = await _redisDb.StringGetAsync(key);
+            if (cachedValue.IsNullOrEmpty)
+                return null;
+
+            return JsonSerializer.Deserialize<MarketDataResponseDto>((string)cachedValue!, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error reading benchmark cache for {Category}/{Region}", category, region);
+            return null;
+        }
     }
+
+    public async Task SetBenchmarkAsync(MarketDataResponseDto dto, CancellationToken ct)
+    {
+        try
+        {
+            var key = GetBenchmarkCacheKey(dto.Category, dto.Region);
+            var json = JsonSerializer.Serialize(dto, JsonOptions);
+            await _redisDb.StringSetAsync(key, json, _defaultTtl);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error writing benchmark cache for {Category}/{Region}", dto.Category, dto.Region);
+        }
+    }
+
+    private static string GetProductCacheKey(string productName) =>
+        $"marketprice:{productName.ToLowerInvariant().Trim()}";
+
+    private static string GetBenchmarkCacheKey(string category, string region) =>
+        $"marketdata:bench:{category.ToLowerInvariant().Trim()}:{region.ToLowerInvariant().Trim()}";
 }

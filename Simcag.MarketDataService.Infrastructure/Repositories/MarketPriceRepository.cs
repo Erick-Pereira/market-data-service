@@ -44,4 +44,21 @@ public class MarketPriceRepository : IMarketPriceRepository
             .Where(mp => mp.IsActive)
             .ToListAsync(ct);
     }
+
+    public async Task<IReadOnlyList<MarketPrice>> GetActiveByCategoryAndRegionAsync(
+        string expenseCategory,
+        string geographicRegion,
+        CancellationToken ct)
+    {
+        var cat = expenseCategory.Trim().ToLower();
+        var reg = geographicRegion.Trim().ToLower();
+
+        return await _dbContext.MarketPrices
+            .AsNoTracking()
+            .Where(mp =>
+                mp.IsActive &&
+                mp.ExpenseCategory.ToLower() == cat &&
+                mp.GeographicRegion.ToLower() == reg)
+            .ToListAsync(ct);
+    }
 }
