@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using Simcag.MarketDataService.Application.Interfaces;
 using Simcag.MarketDataService.Domain.Entities;
 using Simcag.MarketDataService.Infrastructure.Persistence.DbContext;
@@ -10,27 +11,44 @@ namespace Simcag.MarketDataService.Infrastructure.Repositories;
 public class MarketPriceHistoryRepository : IMarketPriceHistoryRepository
 {
     private readonly MarketDataDbContext _dbContext;
+    private readonly ILogger<MarketPriceHistoryRepository> _logger;
 
-    public MarketPriceHistoryRepository(MarketDataDbContext dbContext)
+    public MarketPriceHistoryRepository(MarketDataDbContext dbContext, ILogger<MarketPriceHistoryRepository> logger)
     {
         _dbContext = dbContext;
+        _logger = logger;
     }
 
     public async Task AddAsync(MarketPriceHistory history, CancellationToken ct)
     {
-        await _dbContext.MarketPriceHistory.AddAsync(history, ct);
-        await _dbContext.SaveChangesAsync(ct);
+        try
+        {
+            await _dbContext.MarketPriceHistory.AddAsync(history, ct);
+            await _dbContext.SaveChangesAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "PostgreSQL unavailable while adding MarketPriceHistory productName={ProductName}", history.ProductName);
+        }
     }
 
     public async Task<IEnumerable<MarketPriceHistory>> GetByProductNameAsync(string productName, int days, CancellationToken ct)
     {
         var startDate = DateTime.UtcNow.AddDays(-days);
 
-        return await _dbContext.MarketPriceHistory
-            .AsNoTracking()
-            .Where(h => h.ProductName.ToLower() == productName.ToLower() &&
-                       h.CollectedDate >= startDate)
-            .OrderByDescending(h => h.CollectedDate)
-            .ToListAsync(ct);
+        try
+        {
+            return await _dbContext.MarketPriceHistory
+                .AsNoTracking()
+                .Where(h => h.ProductName.ToLower() == productName.ToLower() &&
+                           h.CollectedDate >= startDate)
+                .OrderByDescending(h => h.CollectedDate)
+                .ToListAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "PostgreSQL unavailable while getting MarketPriceHistory productName={ProductName}", productName);
+            return Array.Empty<MarketPriceHistory>();
+        }
     }
 }
