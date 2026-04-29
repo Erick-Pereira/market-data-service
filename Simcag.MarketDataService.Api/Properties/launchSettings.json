@@ -1,12 +1,12 @@
 {
   "profiles": {
-    "market-data-service": {
+    "Simcag.MarketDataService.Api": {
       "commandName": "Project",
-      "launchBrowser": true,
+      "launchBrowser": false,
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
       },
-      "applicationUrl": "https://localhost:58447;http://localhost:58448"
+      "applicationUrl": "http://localhost:5007"
     }
   }
 }
