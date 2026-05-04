@@ -14,9 +14,12 @@ using Simcag.MarketDataService.Infrastructure.Messaging.Redis;
 using Simcag.MarketDataService.Infrastructure.Persistence.DbContext;
 using Simcag.MarketDataService.Infrastructure.Repositories;
 using StackExchange.Redis;
+using Simcag.Shared.Hosting;
 
-DotNetEnv.Env.Load();
+DotNetEnv.Env.NoClobber().Load();
+ContainerListenConfiguration.NormalizeAspNetCoreListenUrlsInContainer();
 var builder = WebApplication.CreateBuilder(args);
+ContainerListenConfiguration.ApplyDockerListenUrls(builder);
 
 static string? GetEnv(params string[] keys)
 {

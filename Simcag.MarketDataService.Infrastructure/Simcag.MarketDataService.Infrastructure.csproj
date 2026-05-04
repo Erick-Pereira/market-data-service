@@ -16,7 +16,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Simcag.MarketDataService.Application\Simcag.MarketDataService.Application.csproj" />
     <ProjectReference Include="..\Simcag.MarketDataService.Domain\Simcag.MarketDataService.Domain.csproj" />
-    <PackageReference Include="Simcag.Shared" Version="1.0.0" />
+    <PackageReference Include="Simcag.Shared" Version="1.0.3" />
   </ItemGroup>
 
 </Project>
