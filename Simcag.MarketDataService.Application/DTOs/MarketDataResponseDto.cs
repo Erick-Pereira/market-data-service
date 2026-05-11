@@ -10,5 +10,6 @@ public sealed class MarketDataResponseDto
     public decimal MinPrice { get; init; }
     public decimal MaxPrice { get; init; }
     public int SampleSize { get; init; }
-    public DateTime LastUpdated { get; init; }
+    /// <summary>Nulo quando não há amostras reais na base para o par categoria × região.</summary>
+    public DateTime? LastUpdated { get; init; }
 }

@@ -1,5 +1,4 @@
 using Microsoft.Extensions.Logging;
-using Simcag.MarketDataService.Application.Catalog;
 using Simcag.MarketDataService.Application.Classification;
 using Simcag.MarketDataService.Application.DTOs;
 using Simcag.MarketDataService.Application.Interfaces;
@@ -12,21 +11,15 @@ public sealed class MarketBenchmarkQueryService : IMarketBenchmarkQuery
 {
     private readonly IMarketPriceRepository _repository;
     private readonly IMarketDataCacheService _cache;
-    private readonly IMockMarketProductCatalog _mockCatalog;
-    private readonly IRuleBasedExpenseCategoryClassifier _classifier;
     private readonly ILogger<MarketBenchmarkQueryService> _logger;
 
     public MarketBenchmarkQueryService(
         IMarketPriceRepository repository,
         IMarketDataCacheService cache,
-        IMockMarketProductCatalog mockCatalog,
-        IRuleBasedExpenseCategoryClassifier classifier,
         ILogger<MarketBenchmarkQueryService> logger)
     {
         _repository = repository;
         _cache = cache;
-        _mockCatalog = mockCatalog;
-        _classifier = classifier;
         _logger = logger;
     }
 
@@ -45,13 +38,6 @@ public sealed class MarketBenchmarkQueryService : IMarketBenchmarkQuery
         var decimals = rows.Select(p => p.Price).ToList();
         DateTime? lastUpdated = rows.Count > 0 ? rows.Max(r => r.CollectedDate) : null;
 
-        if (decimals.Count == 0)
-        {
-            await _mockCatalog.EnsureSeededAsync(ct);
-            decimals = BuildFallbackPricesFromMockCatalog(cat, reg);
-            lastUpdated ??= DateTime.UtcNow;
-        }
-
         var snapshot = MarketPriceAggregation.BuildSnapshot(cat, reg, decimals, lastUpdated);
         var dto = new MarketDataResponseDto
         {
@@ -67,37 +53,9 @@ public sealed class MarketBenchmarkQueryService : IMarketBenchmarkQuery
 
         await _cache.SetBenchmarkAsync(dto, ct);
         _logger.LogInformation(
-            "Computed market benchmark for {Category}/{Region}: n={Sample}, avg={Avg}",
+            "Benchmark {Category}/{Region}: n={Sample}, avg={Avg}",
             dto.Category, dto.Region, dto.SampleSize, dto.AveragePrice);
 
         return dto;
     }
-
-    private List<decimal> BuildFallbackPricesFromMockCatalog(ExpenseCategory cat, GeographicRegion reg)
-    {
-        // Mock catalog is only keyed by product; region filter uses default seed region or any match.
-        var prices = new List<decimal>();
-        foreach (var (product, basePrice) in _mockCatalog.GetBasePrices())
-        {
-            var productCategory = _classifier.Classify(product);
-            if (!string.Equals(productCategory, cat.Normalized, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            if (!string.Equals(reg.Normalized, GeographicRegion.DefaultSeedRegion, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            prices.Add(ApplyCategoryMultiplier(basePrice, productCategory));
-        }
-
-        return prices;
-    }
-
-    private static decimal ApplyCategoryMultiplier(decimal basePrice, string category) =>
-        category switch
-        {
-            "Notebook" => basePrice * 1.1m,
-            "Hardware" => basePrice * 1.05m,
-            "Monitor" => basePrice * 1.02m,
-            _ => basePrice
-        };
 }

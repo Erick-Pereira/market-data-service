@@ -54,7 +54,7 @@ public static class MarketPriceAggregation
                 region.Normalized,
                 0, 0, 0, 0,
                 0,
-                lastUpdatedUtc ?? DateTime.UtcNow);
+                lastUpdatedUtc);
         }
 
         var trimmed = RemoveOutliersIqr(rawPrices);

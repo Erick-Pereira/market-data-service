@@ -28,7 +28,7 @@ public class MarketPriceHistoryRepository : IMarketPriceHistoryRepository
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "PostgreSQL unavailable while adding MarketPriceHistory productName={ProductName}", history.ProductName);
+            _logger.LogWarning(ex, "Failed to add MarketPriceHistory productName={ProductName}", history.ProductName);
         }
     }
 
@@ -47,7 +47,7 @@ public class MarketPriceHistoryRepository : IMarketPriceHistoryRepository
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "PostgreSQL unavailable while getting MarketPriceHistory productName={ProductName}", productName);
+            _logger.LogWarning(ex, "Failed to read MarketPriceHistory productName={ProductName}", productName);
             return Array.Empty<MarketPriceHistory>();
         }
     }

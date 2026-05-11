@@ -9,4 +9,4 @@ public sealed record MarketBenchmarkSnapshot(
     decimal MinPrice,
     decimal MaxPrice,
     int SampleSize,
-    DateTime LastUpdatedUtc);
+    DateTime? LastUpdatedUtc);

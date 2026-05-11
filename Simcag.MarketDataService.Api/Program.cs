@@ -4,8 +4,8 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Simcag.MarketDataService.Application.Cache;
-using Simcag.MarketDataService.Application.Catalog;
 using Simcag.MarketDataService.Application.Classification;
+using Simcag.MarketDataService.Application.Configuration;
 using Simcag.MarketDataService.Application.Interfaces;
 using Simcag.MarketDataService.Application.Ports;
 using Simcag.MarketDataService.Application.Queries;
@@ -30,6 +30,27 @@ static string? GetEnv(params string[] keys)
             return v;
     }
     return null;
+}
+
+static bool IsTruthyEnv(string? v) =>
+    !string.IsNullOrWhiteSpace(v) &&
+    (string.Equals(v, "1", StringComparison.OrdinalIgnoreCase) ||
+     string.Equals(v, "true", StringComparison.OrdinalIgnoreCase) ||
+     string.Equals(v, "yes", StringComparison.OrdinalIgnoreCase));
+
+/// <summary>Interpreta variável de ambiente como bool; se ausente, usa <paramref name="defaultValue"/>.</summary>
+static bool ParseBoolEnv(string? v, bool defaultValue)
+{
+    if (string.IsNullOrWhiteSpace(v))
+        return defaultValue;
+    if (IsTruthyEnv(v))
+        return true;
+    if (string.Equals(v, "0", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(v, "false", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(v, "no", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(v, "off", StringComparison.OrdinalIgnoreCase))
+        return false;
+    return defaultValue;
 }
 
 static string EnrichRedisConnectionString(string value)
@@ -131,8 +152,36 @@ else
     builder.Services.AddSingleton<IMarketDataCacheService, NoOpMarketDataCacheService>();
 }
 
-builder.Services.AddSingleton<IMockMarketProductCatalog, MockMarketProductCatalog>();
 builder.Services.AddSingleton<IRuleBasedExpenseCategoryClassifier, RuleBasedExpenseCategoryClassifier>();
+
+builder.Services.Configure<MarketResearchOptions>(o =>
+{
+    o.SerpApiKey = GetEnv("MARKET_DATA__SERPAPI_API_KEY", "SERPAPI_API_KEY");
+    o.EnableDuckDuckGoLiteScrape = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_DDG_LITE_SCRAPE"), defaultValue: true);
+    o.EnableBingHtmlScrape = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_BING_HTML_SCRAPE"), defaultValue: true);
+    if (int.TryParse(GetEnv("MARKET_DATA__HTTP_TIMEOUT_SECONDS"), out var timeout) && timeout > 0)
+        o.HttpTimeoutSeconds = timeout;
+});
+
+builder.Services.AddHttpClient(OnlineMarketPriceResearchService.HttpClientSerp)
+    .ConfigureHttpClient((sp, client) =>
+    {
+        var o = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<MarketResearchOptions>>().Value;
+        client.Timeout = TimeSpan.FromSeconds(Math.Max(10, o.HttpTimeoutSeconds + 5));
+    });
+
+builder.Services.AddHttpClient(OnlineMarketPriceResearchService.HttpClientWebScrape)
+    .ConfigureHttpClient((sp, client) =>
+    {
+        var o = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<MarketResearchOptions>>().Value;
+        client.Timeout = TimeSpan.FromSeconds(Math.Max(5, o.HttpTimeoutSeconds));
+        client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        client.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "pt-BR,pt;q=0.9");
+        client.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://duckduckgo.com/");
+    });
+
+builder.Services.AddScoped<IMarketPriceResearchService, OnlineMarketPriceResearchService>();
 
 // Repositories
 builder.Services.AddScoped<IMarketPriceRepository, MarketPriceRepository>();
@@ -141,12 +190,6 @@ builder.Services.AddScoped<IMarketPriceHistoryRepository, MarketPriceHistoryRepo
 // Services
 builder.Services.AddScoped<IMarketDataService, MarketDataService>();
 builder.Services.AddScoped<IMarketBenchmarkQuery, MarketBenchmarkQueryService>();
-
-static bool IsTruthyEnv(string? v) =>
-    !string.IsNullOrWhiteSpace(v) &&
-    (string.Equals(v, "1", StringComparison.OrdinalIgnoreCase) ||
-     string.Equals(v, "true", StringComparison.OrdinalIgnoreCase) ||
-     string.Equals(v, "yes", StringComparison.OrdinalIgnoreCase));
 
 builder.Services.AddSingleton<IMarketDataUpdatedEventPublisher>(sp =>
 {
@@ -168,6 +211,20 @@ if (redisConnection is not null)
     health.AddRedis(EnrichRedisConnectionString(redisConnectionString), name: "Redis");
 
 var app = builder.Build();
+
+// Aplica migrations no arranque (tabelas MarketPrices / MarketPriceHistory). Sem isto, PG devolve 42P01.
+using (var scope = app.Services.CreateScope())
+{
+    try
+    {
+        var db = scope.ServiceProvider.GetRequiredService<MarketDataDbContext>();
+        await db.Database.MigrateAsync();
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex, "Falha ao aplicar migrations do MarketDataDbContext.");
+    }
+}
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())

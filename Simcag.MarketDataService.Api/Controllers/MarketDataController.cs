@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Simcag.MarketDataService.Application.Interfaces;
 using Simcag.Shared.Contracts;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -10,6 +11,7 @@ namespace Simcag.MarketDataService.Api.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[Route("api/market-data")]
 public class MarketDataController : ControllerBase
 {
     private readonly IMarketDataService _marketDataService;
@@ -17,15 +19,26 @@ public class MarketDataController : ControllerBase
     public MarketDataController(IMarketDataService marketDataService) => _marketDataService = marketDataService;
 
     [HttpGet("price")]
-    public async Task<IActionResult> GetPrice([FromQuery] string productName, CancellationToken ct)
+    public async Task<IActionResult> GetPrice(
+        [FromQuery] string? productName,
+        [FromQuery] string? category,
+        [FromQuery] string? region,
+        [FromQuery] decimal? declaredReferenceBrl,
+        CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(productName))
-            return BadRequest(ApiResponse<string>.Fail("Product name is required (ProductNameRequired)"));
+        var name = !string.IsNullOrWhiteSpace(productName)
+            ? productName.Trim()
+            : !string.IsNullOrWhiteSpace(category)
+                ? string.Join(' ', new[] { category.Trim(), region?.Trim() }.Where(s => !string.IsNullOrWhiteSpace(s)))
+                : null;
 
-        var marketPrice = await _marketDataService.GetPriceAsync(productName, ct);
+        if (string.IsNullOrWhiteSpace(name))
+            return BadRequest(ApiResponse<string>.Fail("Provide productName or category (ProductNameRequired)"));
+
+        var marketPrice = await _marketDataService.GetPriceAsync(name, ct, declaredReferenceBrl);
 
         if (marketPrice == null)
-            return NotFound(ApiResponse<string>.Fail($"No market price found for product: {productName} (PriceNotFound)"));
+            return NotFound(ApiResponse<string>.Fail($"No market price found for product: {name} (PriceNotFound)"));
 
         var result = new
         {
@@ -40,17 +53,25 @@ public class MarketDataController : ControllerBase
 
     [HttpGet("history")]
     public async Task<IActionResult> GetPriceHistory(
-        [FromQuery] string productName,
+        [FromQuery] string? productName,
+        [FromQuery] string? category,
+        [FromQuery] string? region,
         CancellationToken ct,
         [FromQuery] int days = 30)
     {
-        if (string.IsNullOrWhiteSpace(productName))
-            return BadRequest(ApiResponse<string>.Fail("Product name is required (ProductNameRequired)"));
+        var name = !string.IsNullOrWhiteSpace(productName)
+            ? productName.Trim()
+            : !string.IsNullOrWhiteSpace(category)
+                ? string.Join(' ', new[] { category.Trim(), region?.Trim() }.Where(s => !string.IsNullOrWhiteSpace(s)))
+                : null;
+
+        if (string.IsNullOrWhiteSpace(name))
+            return BadRequest(ApiResponse<string>.Fail("Provide productName or category (ProductNameRequired)"));
 
         if (days <= 0 || days > 365)
             return BadRequest(ApiResponse<string>.Fail("Days must be between 1 and 365 (InvalidDaysRange)"));
 
-        var history = await _marketDataService.GetPriceHistoryAsync(productName, days, ct);
+        var history = await _marketDataService.GetPriceHistoryAsync(name, days, ct);
 
         var result = history.Select(h => new
         {
@@ -61,12 +82,5 @@ public class MarketDataController : ControllerBase
         });
 
         return Ok(ApiResponse<object>.Ok(result));
-    }
-
-    [HttpPost("seed")]
-    public async Task<IActionResult> SeedMockData(CancellationToken ct)
-    {
-        await _marketDataService.SeedMockDataAsync(ct);
-        return Ok(ApiResponse<string>.Ok("Mock market data seeded successfully"));
     }
 }
