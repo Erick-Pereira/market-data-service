@@ -25,6 +25,11 @@ public class MarketPriceHistoryRepository : IMarketPriceHistoryRepository
         {
             await _dbContext.MarketPriceHistory.AddAsync(history, ct);
             await _dbContext.SaveChangesAsync(ct);
+            _logger.LogDebug(
+                "MarketPriceHistory gravado: productName={ProductName}, price={Price}, sourceLen={Len}",
+                history.ProductName,
+                history.Price,
+                history.Source.Length);
         }
         catch (Exception ex)
         {
