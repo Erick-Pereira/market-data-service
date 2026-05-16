@@ -35,17 +35,29 @@ public class MarketDataController : ControllerBase
         if (string.IsNullOrWhiteSpace(name))
             return BadRequest(ApiResponse<string>.Fail("Provide productName or category (ProductNameRequired)"));
 
-        var marketPrice = await _marketDataService.GetPriceAsync(name, ct, declaredReferenceBrl);
+        var resolution = await _marketDataService.ResolvePriceAsync(name, ct, declaredReferenceBrl);
 
-        if (marketPrice == null)
+        if (resolution == null)
             return NotFound(ApiResponse<string>.Fail($"No market price found for product: {name} (PriceNotFound)"));
 
+        var quote = resolution.Quote;
         var result = new
         {
-            marketPrice.ProductName,
-            marketPrice.Price,
-            marketPrice.Source,
-            marketPrice.CollectedDate
+            quote.ProductName,
+            quote.Price,
+            quote.Source,
+            quote.CollectedDate,
+            resolution.SampleCount,
+            resolution.RelativeSpread,
+            resolution.SearchQueryUsed,
+            resolution.NormalizedProductName,
+            resolution.Confidence,
+            benchmarkKind = resolution.BenchmarkKind.ToString(),
+            resolution.BenchmarkStatus,
+            resolution.ConfidenceScore,
+            resolution.BenchmarkQualityScore,
+            resolution.BenchmarkDiagnostics,
+            resolution.BenchmarkRejectionTrail
         };
 
         return Ok(ApiResponse<object>.Ok(result!));

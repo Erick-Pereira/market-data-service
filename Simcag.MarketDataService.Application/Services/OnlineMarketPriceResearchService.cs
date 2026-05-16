@@ -1,76 +1,159 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text;
 using System.Text.Json;
-using AngleSharp.Html.Parser;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Simcag.MarketDataService.Application.Benchmarking;
+using Simcag.MarketDataService.Application.Benchmarking.Providers;
 using Simcag.MarketDataService.Application.Configuration;
 using Simcag.MarketDataService.Application.Interfaces;
+using Simcag.Shared.Telemetry;
 
 namespace Simcag.MarketDataService.Application.Services;
 
 /// <summary>
-/// Prioriza scraping local (HTML público: DuckDuckGo lite, Bing). Opcionalmente SerpAPI se houver chave.
-/// Não gera preços — apenas interpreta texto público (mediana de menções a R$ plausíveis).
+/// Orquestra providers de amostragem (DDG/Bing), agregação com mediana e SerpAPI opcional.
 /// </summary>
 public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchService
 {
-    public const string HttpClientWebScrape = "MarketDataWebScrape";
-    public const string HttpClientSerp = "MarketDataSerpApi";
+    /// <summary>Compatível com registos DI existentes.</summary>
+    public const string HttpClientWebScrape = MarketDataHttpClients.WebScrape;
+
+    public const string HttpClientSerp = MarketDataHttpClients.Serp;
+
+    private const string SerpApiBase = "https://serpapi.com/search.json";
 
     private readonly MarketResearchOptions _opt;
     private readonly IHttpClientFactory _httpFactory;
     private readonly ILogger<OnlineMarketPriceResearchService> _log;
-
-    private const string SerpApiBase = "https://serpapi.com/search.json";
+    private readonly IReadOnlyList<IMarketPriceSampleProvider> _sampleProviders;
 
     public OnlineMarketPriceResearchService(
         IOptions<MarketResearchOptions> options,
         IHttpClientFactory httpFactory,
-        ILogger<OnlineMarketPriceResearchService> log)
+        ILogger<OnlineMarketPriceResearchService> log,
+        DdgLiteMarketPriceProvider ddgLite,
+        DdgHtmlMarketPriceProvider ddgHtml,
+        BingHtmlMarketPriceProvider bingHtml)
     {
         _opt = options.Value;
         _httpFactory = httpFactory;
         _log = log;
+        _sampleProviders = new IMarketPriceSampleProvider[] { ddgLite, ddgHtml, bingHtml };
     }
 
-    public async Task<MarketPriceResearchResult?> TryResolvePriceAsync(string productQuery, CancellationToken cancellationToken = default)
+    public async Task<MarketPriceResearchResult?> TryResolvePriceAsync(
+        string productQuery,
+        CancellationToken cancellationToken = default)
     {
+        var d = await TryResolvePriceDetailedAsync(productQuery, cancellationToken);
+        return d.Result;
+    }
+
+    public async Task<MarketPriceResearchDetailedOutcome> TryResolvePriceDetailedAsync(
+        string productQuery,
+        CancellationToken cancellationToken = default)
+    {
+        var rejections = new List<string>();
+        var diagnostics = new List<BenchmarkDiagnosticEntry>();
+
         if (string.IsNullOrWhiteSpace(productQuery))
-            return null;
+        {
+            rejections.Add("empty_query");
+            diagnostics.Add(new BenchmarkDiagnosticEntry("orchestrator", "validate", "productQuery vazio", null));
+            return new MarketPriceResearchDetailedOutcome(null, rejections, diagnostics);
+        }
+
+        using var root = SimcagActivitySources.MarketData.StartActivity("marketdata.price_research", ActivityKind.Internal);
+        root?.SetTag("marketdata.query.length", productQuery.Trim().Length);
+        var sw = Stopwatch.StartNew();
 
         var q = BuildSearchQuery(productQuery.Trim());
 
-        if (_opt.EnableDuckDuckGoLiteScrape)
+        var batches = await Task.WhenAll(_sampleProviders.Select(p => p.FetchSamplesAsync(q, cancellationToken)));
+        foreach (var b in batches)
         {
-            var fromDdg = await TryDuckDuckGoLiteAsync(q, cancellationToken);
-            if (fromDdg is not null)
-                return fromDdg;
-            var fromDdgHtml = await TryDuckDuckGoHtmlAsync(q, cancellationToken);
-            if (fromDdgHtml is not null)
-                return fromDdgHtml;
+            diagnostics.Add(new BenchmarkDiagnosticEntry(
+                $"provider:{b.ProviderId}",
+                "fetch",
+                b.Outcome,
+                b.Detail));
         }
 
-        if (_opt.EnableBingHtmlScrape)
+        var merged = batches.SelectMany(b => b.Samples).ToList();
+        var antiBot = batches.Any(b => b.AntiBotLikely);
+
+        if (merged.Count > 0)
         {
-            var fromBing = await TryBingHtmlAsync(q, cancellationToken);
-            if (fromBing is not null)
-                return fromBing;
+            var fromAgg = BuildFromExtracted(
+                merged,
+                "WebScrape:Aggregated(DDG+Bing)",
+                "Consolidação de valores em BRL extraídos dos snippets DuckDuckGo e Bing.",
+                q,
+                structuredPriceList: false,
+                antiBotLikely: antiBot,
+                rejections);
+            if (fromAgg is not null)
+            {
+                RecordBenchmarkEnd(sw, success: true, source: "web_scrape");
+                return new MarketPriceResearchDetailedOutcome(
+                    fromAgg with { Diagnostics = diagnostics },
+                    rejections,
+                    diagnostics);
+            }
+        }
+        else
+        {
+            rejections.Add("web_scrape_no_price_samples");
+            SimcagMeters.MarketDataBenchmarkRejections.Add(1,
+                new KeyValuePair<string, object?>("reason", "no_samples"),
+                new KeyValuePair<string, object?>("stage", "aggregate"));
         }
 
         if (!string.IsNullOrWhiteSpace(_opt.SerpApiKey))
         {
-            var fromSerp = await TrySerpApiAsync(q, cancellationToken);
-            if (fromSerp is not null)
-                return fromSerp;
+            using (SimcagActivitySources.MarketData.StartActivity("marketdata.serpapi", ActivityKind.Client))
+            {
+                var fromSerp = await TrySerpApiAsync(q, diagnostics, rejections, cancellationToken);
+                if (fromSerp is not null)
+                {
+                    RecordBenchmarkEnd(sw, success: true, source: "serp");
+                    return new MarketPriceResearchDetailedOutcome(
+                        fromSerp with { Diagnostics = diagnostics },
+                        rejections,
+                        diagnostics);
+                }
+            }
         }
         else
         {
+            diagnostics.Add(new BenchmarkDiagnosticEntry("serpapi", "config", "SerpAPI omitida (sem chave)", null));
             _log.LogDebug(
-                "SerpAPI não configurado (MARKET_DATA__SERPAPI_API_KEY / SERPAPI_API_KEY vazio); fallback pago omitido.");
+                "SerpAPI não configurada (MARKET_DATA__SERPAPI_API_KEY / SERPAPI_API_KEY vazio); fallback pago omitido.");
         }
 
-        return null;
+        if (rejections.Count == 0)
+            rejections.Add("no_usable_external_estimate");
+
+        RecordBenchmarkEnd(sw, success: false, source: "none");
+        _log.LogInformation(
+            "Pesquisa de preço sem resultado utilizável (Query={Query}); rejeições={Rejections}",
+            q,
+            string.Join(",", rejections));
+        return new MarketPriceResearchDetailedOutcome(null, rejections, diagnostics);
+    }
+
+    private void RecordBenchmarkEnd(Stopwatch sw, bool success, string source)
+    {
+        var elapsed = sw.Elapsed.TotalSeconds;
+        SimcagMeters.MarketDataBenchmarkDurationSeconds.Record(elapsed,
+            new KeyValuePair<string, object?>("success", success),
+            new KeyValuePair<string, object?>("source", source));
+        if (success)
+            SimcagMeters.MarketDataBenchmarkSuccess.Add(1, new KeyValuePair<string, object?>("source", source));
+        else
+            SimcagMeters.MarketDataBenchmarkEmpty.Add(1, new KeyValuePair<string, object?>("source", source));
     }
 
     private static string BuildSearchQuery(string raw) =>
@@ -79,174 +162,111 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
             ? raw + " Brasil"
             : raw + " preço Brasil";
 
-    private async Task<MarketPriceResearchResult?> TryDuckDuckGoLiteAsync(string searchQuery, CancellationToken ct)
+    private MarketPriceResearchResult? BuildFromExtracted(
+        IReadOnlyList<decimal> extracted,
+        string source,
+        string? evidenceSnippet,
+        string searchQueryUsed,
+        bool structuredPriceList,
+        bool antiBotLikely,
+        List<string> rejections)
     {
-        try
+        var minSamples = structuredPriceList
+            ? Math.Max(1, _opt.MinimumPriceSamplesForStructuredList)
+            : Math.Max(1, _opt.MinimumPriceSamplesForWebScrape);
+        var distinctPrices = extracted.Distinct().ToList();
+        if (distinctPrices.Count < minSamples)
         {
-            var client = _httpFactory.CreateClient(HttpClientWebScrape);
-            var url = "https://lite.duckduckgo.com/lite/?q=" + Uri.EscapeDataString(searchQuery);
-            using var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
-            // 202 do DDG lite costuma ser página de bloqueio; IsSuccessStatusCode seria true — exigir 200.
-            if (resp.StatusCode != HttpStatusCode.OK)
-                return null;
-
-            var html = await resp.Content.ReadAsStringAsync(ct);
-            var text = ExtractDuckDuckGoLiteResultText(html);
-            var extracted = BrazilianMoneyParser.ExtractAll(text);
-            var median = BrazilianMoneyParser.Median(extracted);
-            if (median is null)
-                return null;
-
-            return new MarketPriceResearchResult(median.Value, "DuckDuckGoLite:Snippets",
-                "Mediana de menções a valores em BRL nos trechos de resultado (fonte agregada pública).");
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "Falha na pesquisa DuckDuckGo lite para {Query}", searchQuery);
+            rejections.Add(BenchmarkStatuses.RejectedInsufficientSamples);
+            SimcagMeters.MarketDataBenchmarkRejections.Add(1,
+                new KeyValuePair<string, object?>("reason", "insufficient_samples"),
+                new KeyValuePair<string, object?>("stage", structuredPriceList ? "structured" : "web_scrape"));
+            _log.LogInformation(
+                "Cotação rejeitada: amostras insuficientes (distinct={Distinct}, min={Min}, structured={Structured})",
+                distinctPrices.Count,
+                minSamples,
+                structuredPriceList);
             return null;
         }
-    }
 
-    private static string ExtractDuckDuckGoLiteResultText(string html)
-    {
-        try
+        if (_opt.RequireDistinctSamplesForWebScrape && !structuredPriceList && distinctPrices.Count < 2)
         {
-            var doc = new HtmlParser().ParseDocument(html);
-            var links = doc.QuerySelector("#links");
-            if (links is not null)
-                return links.TextContent ?? string.Empty;
-            var results = doc.QuerySelector(".results");
-            if (results is not null)
-                return results.TextContent ?? string.Empty;
-        }
-        catch
-        {
-            // fallback abaixo
-        }
-
-        return html;
-    }
-
-    private async Task<MarketPriceResearchResult?> TryDuckDuckGoHtmlAsync(string searchQuery, CancellationToken ct)
-    {
-        try
-        {
-            var client = _httpFactory.CreateClient(HttpClientWebScrape);
-            var url = "https://html.duckduckgo.com/html/?q=" + Uri.EscapeDataString(searchQuery);
-            using var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
-            if (resp.StatusCode != HttpStatusCode.OK)
-                return null;
-
-            var html = await resp.Content.ReadAsStringAsync(ct);
-            var text = ExtractDuckDuckGoHtmlResultText(html);
-            var extracted = BrazilianMoneyParser.ExtractAll(text);
-            var median = BrazilianMoneyParser.Median(extracted);
-            if (median is null)
-                return null;
-
-            return new MarketPriceResearchResult(median.Value, "DuckDuckGoHtml:Snippets",
-                "Mediana de menções a valores em BRL nos resultados HTML do DuckDuckGo.");
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "Falha na pesquisa DuckDuckGo HTML para {Query}", searchQuery);
+            rejections.Add(BenchmarkStatuses.RejectedDistinctSamples);
+            SimcagMeters.MarketDataBenchmarkRejections.Add(1,
+                new KeyValuePair<string, object?>("reason", "distinct_samples_policy"),
+                new KeyValuePair<string, object?>("stage", "web_scrape"));
+            _log.LogInformation(
+                "Cotação web rejeitada: política exige ≥2 preços distintos (distinct={Distinct})",
+                distinctPrices.Count);
             return null;
         }
-    }
 
-    private static string ExtractDuckDuckGoHtmlResultText(string html)
-    {
-        try
+        var median = BrazilianMoneyParser.Median(distinctPrices);
+        if (median is null)
+            return null;
+
+        var spread = BrazilianMoneyParser.RelativeSpreadAroundMedian(distinctPrices, median.Value);
+        if (!structuredPriceList && distinctPrices.Count >= 2 && spread > _opt.MaxRelativeSpreadForWebScrape)
         {
-            var doc = new HtmlParser().ParseDocument(html);
-            var results = doc.QuerySelector(".results") ?? doc.QuerySelector("#links");
-            if (results is not null)
-                return results.TextContent ?? string.Empty;
-        }
-        catch
-        {
-            // fallback
-        }
-
-        return html;
-    }
-
-    private async Task<MarketPriceResearchResult?> TryBingHtmlAsync(string searchQuery, CancellationToken ct)
-    {
-        try
-        {
-            var client = _httpFactory.CreateClient(HttpClientWebScrape);
-            var url = "https://www.bing.com/search?q=" + Uri.EscapeDataString(searchQuery)
-                      + "&cc=BR&setlang=pt-br&mkt=pt-BR";
-            using var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
-            if (resp.StatusCode != HttpStatusCode.OK)
-                return null;
-
-            var html = await resp.Content.ReadAsStringAsync(ct);
-            var text = ExtractBingOrganicSnippets(html);
-            if (string.IsNullOrWhiteSpace(text))
-                return null;
-
-            var extracted = BrazilianMoneyParser.ExtractAll(text);
-            var median = BrazilianMoneyParser.Median(extracted);
-            if (median is null)
-                return null;
-
-            return new MarketPriceResearchResult(median.Value, "BingHtml:OrganicSnippets",
-                "Mediana de menções a valores em BRL nos snippets orgânicos retornados.");
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "Falha na pesquisa Bing HTML para {Query}", searchQuery);
+            rejections.Add(BenchmarkStatuses.RejectedSpread);
+            SimcagMeters.MarketDataBenchmarkRejections.Add(1,
+                new KeyValuePair<string, object?>("reason", "spread"),
+                new KeyValuePair<string, object?>("stage", "web_scrape"));
+            _log.LogInformation(
+                "Cotação web rejeitada por dispersão (spread={Spread:F2} > {Max}, amostras={Count}, fonte={Source})",
+                spread,
+                _opt.MaxRelativeSpreadForWebScrape,
+                distinctPrices.Count,
+                source);
             return null;
         }
+
+        var (confidence, quality) = BenchmarkConfidenceCalculator.Compute(
+            distinctPrices.Count,
+            spread,
+            structuredPriceList,
+            antiBotLikely);
+
+        return new MarketPriceResearchResult(
+            median.Value,
+            source,
+            evidenceSnippet,
+            distinctPrices.Count,
+            spread,
+            searchQueryUsed,
+            BenchmarkPriceKind.ExternalMarketEstimate,
+            BenchmarkStatuses.ResolvedExternal,
+            confidence,
+            quality,
+            Diagnostics: null);
     }
 
-    private static string ExtractBingOrganicSnippets(string html)
-    {
-        try
-        {
-            var doc = new HtmlParser().ParseDocument(html);
-            var algos = doc.QuerySelectorAll("li.b_algo");
-            var sb = new StringBuilder();
-            if (algos.Length > 0)
-            {
-                foreach (var li in algos)
-                    sb.AppendLine(li.TextContent);
-            }
-            else
-            {
-                var block = doc.QuerySelector("#b_results");
-                if (block is not null)
-                    sb.AppendLine(block.TextContent);
-            }
-
-            return sb.ToString();
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
-
-    private async Task<MarketPriceResearchResult?> TrySerpApiAsync(string searchQuery, CancellationToken ct)
+    private async Task<MarketPriceResearchResult?> TrySerpApiAsync(
+        string searchQuery,
+        List<BenchmarkDiagnosticEntry> diagnostics,
+        List<string> rejections,
+        CancellationToken ct)
     {
         try
         {
             var client = _httpFactory.CreateClient(HttpClientSerp);
 
-            using (var shoppingDoc = await FetchSerpJsonAsync(client, BuildSerpUrl("google_shopping", searchQuery), ct))
+            using (var shoppingDoc = await FetchSerpJsonAsync(client, BuildSerpUrl("google_shopping", searchQuery), diagnostics, ct))
             {
-                var fromShopping = ParseSerpShopping(shoppingDoc);
+                var fromShopping = ParseSerpShopping(shoppingDoc, searchQuery, rejections);
                 if (fromShopping is not null)
                     return fromShopping;
             }
 
-            using var organicDoc = await FetchSerpJsonAsync(client, BuildSerpUrl("google", searchQuery), ct);
-            return ParseSerpOrganic(organicDoc);
+            using var organicDoc = await FetchSerpJsonAsync(client, BuildSerpUrl("google", searchQuery), diagnostics, ct);
+            return ParseSerpOrganic(organicDoc, searchQuery, rejections);
         }
         catch (Exception ex)
         {
+            SimcagMeters.MarketDataScrapeHttpErrors.Add(1,
+                new KeyValuePair<string, object?>("source", "serpapi"),
+                new KeyValuePair<string, object?>("reason", "exception"));
+            diagnostics.Add(new BenchmarkDiagnosticEntry("serpapi", "exception", ex.GetType().Name, ex.Message));
             _log.LogWarning(ex, "Falha na pesquisa SerpAPI para {Query}", searchQuery);
             return null;
         }
@@ -259,11 +279,27 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         return $"{SerpApiBase}?engine={E(engine)}&q={E(q)}&api_key={key}&hl=pt&gl=br&google_domain=google.com.br";
     }
 
-    private async Task<JsonDocument?> FetchSerpJsonAsync(HttpClient client, string url, CancellationToken ct)
+    private async Task<JsonDocument?> FetchSerpJsonAsync(
+        HttpClient client,
+        string url,
+        List<BenchmarkDiagnosticEntry> diagnostics,
+        CancellationToken ct)
     {
         using var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+        if (resp.StatusCode == HttpStatusCode.Accepted)
+        {
+            SimcagMeters.MarketDataScrapeHttpAccepted.Add(1,
+                new KeyValuePair<string, object?>("provider", "serpapi"));
+            diagnostics.Add(new BenchmarkDiagnosticEntry("serpapi", "http", "202 Accepted", url));
+            return null;
+        }
+
         if (!resp.IsSuccessStatusCode)
         {
+            SimcagMeters.MarketDataScrapeHttpErrors.Add(1,
+                new KeyValuePair<string, object?>("source", "serpapi"),
+                new KeyValuePair<string, object?>("status_code", (int)resp.StatusCode));
+            diagnostics.Add(new BenchmarkDiagnosticEntry("serpapi", "http", "not_success", ((int)resp.StatusCode).ToString()));
             _log.LogWarning("SerpAPI HTTP {Code}", resp.StatusCode);
             return null;
         }
@@ -272,7 +308,7 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         return await JsonDocument.ParseAsync(stream, cancellationToken: ct);
     }
 
-    private MarketPriceResearchResult? ParseSerpShopping(JsonDocument? doc)
+    private MarketPriceResearchResult? ParseSerpShopping(JsonDocument? doc, string searchQueryUsed, List<string> rejections)
     {
         if (doc is null)
             return null;
@@ -314,14 +350,11 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
                     : null;
         }
 
-        var median = BrazilianMoneyParser.Median(amounts);
-        if (median is null || median.Value <= 0m)
-            return null;
-
-        return new MarketPriceResearchResult(median.Value, "SerpApi:GoogleShopping", snippet);
+        return BuildFromExtracted(amounts, "SerpApi:GoogleShopping", snippet, searchQueryUsed, structuredPriceList: true,
+            antiBotLikely: false, rejections);
     }
 
-    private MarketPriceResearchResult? ParseSerpOrganic(JsonDocument? doc)
+    private MarketPriceResearchResult? ParseSerpOrganic(JsonDocument? doc, string searchQueryUsed, List<string> rejections)
     {
         if (doc is null)
             return null;
@@ -346,11 +379,8 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
 
         var text = string.Join(" ", chunks.Where(s => !string.IsNullOrEmpty(s)));
         var extracted = BrazilianMoneyParser.ExtractAll(text);
-        var median = BrazilianMoneyParser.Median(extracted);
-        if (median is null)
-            return null;
-
         var ev = text.Length > 280 ? text[..280] : text;
-        return new MarketPriceResearchResult(median.Value, "SerpApi:GoogleOrganic", ev);
+        return BuildFromExtracted(extracted, "SerpApi:GoogleOrganic", ev, searchQueryUsed, structuredPriceList: false,
+            antiBotLikely: false, rejections);
     }
 }

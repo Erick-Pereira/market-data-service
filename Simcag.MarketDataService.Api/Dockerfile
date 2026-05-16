@@ -1,6 +1,6 @@
 # Multi-stage — contexto: pasta market-data-service. API: market-data-service.csproj; DLL: Simcag.MarketDataService.Api.dll
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS builder
+FROM mcr.microsoft.com/dotnet/sdk:10.0-noble AS builder
 
 WORKDIR /src
 
@@ -34,7 +34,7 @@ RUN dotnet publish "Simcag.MarketDataService.Api/market-data-service.csproj" \
     --no-restore \
     /p:UseAppHost=false
 
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble AS runtime
 
 WORKDIR /app
 

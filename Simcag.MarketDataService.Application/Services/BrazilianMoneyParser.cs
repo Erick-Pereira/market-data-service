@@ -11,12 +11,16 @@ internal static partial class BrazilianMoneyParser
     [
         new Regex(@"R\$\s*([\d]{1,3}(?:\.\d{3})*(?:,\d{2}))", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
         new Regex(@"R\$\s*(\d+,\d{2})\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
+        // Snippets BR frequentes sem "R$" explícito (ex.: "por 1.299,00")
+        new Regex(@"(?<![\d/])(\d{1,3}(?:\.\d{3})+,\d{2})\b(?!\d)", RegexOptions.CultureInvariant),
     ];
 
     public static IReadOnlyList<decimal> ExtractAll(string? text)
     {
         if (string.IsNullOrWhiteSpace(text))
             return Array.Empty<decimal>();
+
+        text = text.Replace('\u00A0', ' ').Replace('\u202F', ' ');
 
         var list = new List<decimal>();
         foreach (var rx in Patterns)
@@ -41,6 +45,16 @@ internal static partial class BrazilianMoneyParser
         var s = values.OrderBy(x => x).ToArray();
         var mid = s.Length / 2;
         return s.Length % 2 == 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2m;
+    }
+
+    /// <summary>Dispersão (max−min)/mediana; 0 se menos de 2 amostras ou mediana ≤ 0.</summary>
+    public static decimal RelativeSpreadAroundMedian(IReadOnlyList<decimal> values, decimal median)
+    {
+        if (values.Count < 2 || median <= 0m)
+            return 0m;
+        var min = values.Min();
+        var max = values.Max();
+        return (max - min) / median;
     }
 
     /// <summary>Rejeita valores absurdos para referência de mercado.</summary>

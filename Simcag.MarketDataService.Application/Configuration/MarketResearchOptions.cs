@@ -22,4 +22,31 @@ public sealed class MarketResearchOptions
 
     /// <summary>Máximo de segundos por pedido HTTP de pesquisa.</summary>
     public int HttpTimeoutSeconds { get; set; } = 25;
+
+    /// <summary>
+    /// Mínimo de menções a valores em BRL extraídas do HTML para aceitar mediana (scraping DDG/Bing agregado).
+    /// Default 1: com agregação DDG+Bing e valores <c>R$</c> + formato BR, uma amostra plausível já alimenta o benchmark.
+    /// </summary>
+    public int MinimumPriceSamplesForWebScrape { get; set; } = 1;
+
+    /// <summary>Mínimo de preços estruturados (ex.: Serp shopping) para aceitar mediana.</summary>
+    public int MinimumPriceSamplesForStructuredList { get; set; } = 1;
+
+    /// <summary>
+    /// Se (max−min)/mediana do conjunto extraído exceder este valor, rejeita-se a cotação de scraping (HTML).
+    /// SerpAPI shopping ignora este limite (lista já mais estruturada).
+    /// </summary>
+    public decimal MaxRelativeSpreadForWebScrape { get; set; } = 2.5m;
+
+    /// <summary>Retentativas adicionais por pedido HTTP de scrape (total tentativas = 1 + valor).</summary>
+    public int ScrapeMaxRetries { get; set; } = 2;
+
+    /// <summary>Backoff base entre retentativas de scrape (ms).</summary>
+    public int ScrapeRetryBaseDelayMilliseconds { get; set; } = 400;
+
+    /// <summary>
+    /// Quando verdadeiro, exige pelo menos duas amostras distintas de scraping HTML antes de mediana
+    /// (reduz falsos positivos de um único valor espúrio). SerpAPI shopping não é afetado.
+    /// </summary>
+    public bool RequireDistinctSamplesForWebScrape { get; set; }
 }

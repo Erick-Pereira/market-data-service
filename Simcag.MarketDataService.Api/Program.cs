@@ -3,6 +3,8 @@ using DotNetEnv;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Simcag.MarketDataService.Application;
+using Simcag.MarketDataService.Application.Benchmarking.Providers;
 using Simcag.MarketDataService.Application.Cache;
 using Simcag.MarketDataService.Application.Classification;
 using Simcag.MarketDataService.Application.Configuration;
@@ -15,10 +17,12 @@ using Simcag.MarketDataService.Infrastructure.Persistence.DbContext;
 using Simcag.MarketDataService.Infrastructure.Repositories;
 using StackExchange.Redis;
 using Simcag.Shared.Hosting;
+using Simcag.Shared.Telemetry;
 
 DotNetEnv.Env.NoClobber().Load();
 ContainerListenConfiguration.NormalizeAspNetCoreListenUrlsInContainer();
 var builder = WebApplication.CreateBuilder(args);
+builder.AddSimcagDistributedTelemetry("Simcag.MarketDataService");
 ContainerListenConfiguration.ApplyDockerListenUrls(builder);
 
 static string? GetEnv(params string[] keys)
@@ -161,16 +165,25 @@ builder.Services.Configure<MarketResearchOptions>(o =>
     o.EnableBingHtmlScrape = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_BING_HTML_SCRAPE"), defaultValue: true);
     if (int.TryParse(GetEnv("MARKET_DATA__HTTP_TIMEOUT_SECONDS"), out var timeout) && timeout > 0)
         o.HttpTimeoutSeconds = timeout;
+    if (int.TryParse(GetEnv("MARKET_DATA__MINIMUM_PRICE_SAMPLES_WEB_SCRAPE"), out var minWs) && minWs >= 1)
+        o.MinimumPriceSamplesForWebScrape = minWs;
+    if (int.TryParse(GetEnv("MARKET_DATA__SCRAPE_MAX_RETRIES"), out var sm) && sm >= 0)
+        o.ScrapeMaxRetries = sm;
+    if (int.TryParse(GetEnv("MARKET_DATA__SCRAPE_RETRY_BASE_MS"), out var sb) && sb >= 50)
+        o.ScrapeRetryBaseDelayMilliseconds = sb;
+    o.RequireDistinctSamplesForWebScrape = ParseBoolEnv(
+        GetEnv("MARKET_DATA__REQUIRE_DISTINCT_SAMPLES_WEB_SCRAPE"),
+        defaultValue: false);
 });
 
-builder.Services.AddHttpClient(OnlineMarketPriceResearchService.HttpClientSerp)
+builder.Services.AddHttpClient(MarketDataHttpClients.Serp)
     .ConfigureHttpClient((sp, client) =>
     {
         var o = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<MarketResearchOptions>>().Value;
         client.Timeout = TimeSpan.FromSeconds(Math.Max(10, o.HttpTimeoutSeconds + 5));
     });
 
-builder.Services.AddHttpClient(OnlineMarketPriceResearchService.HttpClientWebScrape)
+builder.Services.AddHttpClient(MarketDataHttpClients.WebScrape)
     .ConfigureHttpClient((sp, client) =>
     {
         var o = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<MarketResearchOptions>>().Value;
@@ -181,6 +194,9 @@ builder.Services.AddHttpClient(OnlineMarketPriceResearchService.HttpClientWebScr
         client.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://duckduckgo.com/");
     });
 
+builder.Services.AddScoped<DdgLiteMarketPriceProvider>();
+builder.Services.AddScoped<DdgHtmlMarketPriceProvider>();
+builder.Services.AddScoped<BingHtmlMarketPriceProvider>();
 builder.Services.AddScoped<IMarketPriceResearchService, OnlineMarketPriceResearchService>();
 
 // Repositories
@@ -212,6 +228,8 @@ if (redisConnection is not null)
 
 var app = builder.Build();
 
+app.UseSimcagHttpCorrelationActivityTags();
+
 // Aplica migrations no arranque (tabelas MarketPrices / MarketPriceHistory). Sem isto, PG devolve 42P01.
 using (var scope = app.Services.CreateScope())
 {
@@ -238,5 +256,7 @@ app.UseAuthorization();
 app.MapGet("/", () => Results.Redirect("/swagger"));
 app.MapControllers();
 app.MapHealthChecks("/health");
+
+app.UseSimcagTelemetryEndpoints();
 
 app.Run();

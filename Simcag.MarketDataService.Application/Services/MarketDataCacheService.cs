@@ -151,7 +151,7 @@ public class MarketDataCacheService : IMarketDataCacheService
     }
 
     private static string GetProductCacheKey(string productName) =>
-        $"marketprice:{productName.ToLowerInvariant().Trim()}";
+        $"marketprice:{ProductNameNormalizer.Normalize(productName).ToLowerInvariant()}";
 
     private static string GetBenchmarkCacheKey(string category, string region) =>
         $"marketdata:bench:{category.ToLowerInvariant().Trim()}:{region.ToLowerInvariant().Trim()}";

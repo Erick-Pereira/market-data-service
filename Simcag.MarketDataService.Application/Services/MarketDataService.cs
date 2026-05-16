@@ -1,6 +1,8 @@
 using System.Linq;
 using Microsoft.Extensions.Logging;
+using Simcag.MarketDataService.Application.Benchmarking;
 using Simcag.MarketDataService.Application.Classification;
+using Simcag.MarketDataService.Application.DTOs;
 using Simcag.MarketDataService.Application.Interfaces;
 using Simcag.MarketDataService.Domain.Entities;
 using Simcag.MarketDataService.Domain.ValueObjects;
@@ -52,12 +54,36 @@ public class MarketDataService : IMarketDataService
 
     public async Task<MarketPrice?> GetPriceAsync(string productName, CancellationToken ct, decimal? declaredReferenceBrl = null)
     {
-        var cachedPrice = await _cacheService.GetMarketPriceAsync(productName, ct);
-        if (cachedPrice != null)
-            return cachedPrice;
+        var resolution = await ResolvePriceAsync(productName, ct, declaredReferenceBrl);
+        return resolution?.Quote;
+    }
 
-        var standardizedName = ProductNameNormalizer.Normalize(productName);
-        var searchNames = new[] { productName, standardizedName }.Distinct().ToArray();
+    public async Task<MarketPriceResolution?> ResolvePriceAsync(
+        string productName,
+        CancellationToken ct,
+        decimal? declaredReferenceBrl = null)
+    {
+        var trimmed = productName.Trim();
+        var normalizedLabel = ProductNameNormalizer.Normalize(trimmed);
+
+        var cachedPrice = await _cacheService.GetMarketPriceAsync(trimmed, ct);
+        if (cachedPrice != null)
+        {
+            return new MarketPriceResolution(
+                cachedPrice,
+                null,
+                null,
+                null,
+                normalizedLabel,
+                "redis-cache",
+                BenchmarkPriceKind.ExternalMarketEstimate,
+                BenchmarkStatuses.CacheHit);
+        }
+
+        var standardizedName = normalizedLabel;
+        var searchNames = new[] { trimmed, standardizedName }
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
         foreach (var searchName in searchNames)
         {
@@ -66,11 +92,30 @@ public class MarketDataService : IMarketDataService
             {
                 var result = MarketPrice.Create(fromDb.ProductName, Math.Round(fromDb.Price, 2), "PostgreSQL");
                 await _cacheService.SetMarketPriceAsync(result, ct);
-                return result;
+                return new MarketPriceResolution(
+                    result,
+                    null,
+                    null,
+                    null,
+                    normalizedLabel,
+                    "postgresql",
+                    BenchmarkPriceKind.ExternalMarketEstimate,
+                    BenchmarkStatuses.DatabaseHit);
             }
         }
 
-        var researched = await _research.TryResolvePriceAsync(productName, ct);
+        MarketPriceResearchDetailedOutcome? lastWeb = null;
+        MarketPriceResearchResult? researched = null;
+        foreach (var query in searchNames)
+        {
+            lastWeb = await _research.TryResolvePriceDetailedAsync(query, ct);
+            if (lastWeb.Result is not null)
+            {
+                researched = lastWeb.Result;
+                break;
+            }
+        }
+
         if (researched is null
             && declaredReferenceBrl is > 0.01m and <= 50_000_000m)
         {
@@ -78,10 +123,27 @@ public class MarketDataService : IMarketDataService
             researched = new MarketPriceResearchResult(
                 rounded,
                 MarketPriceSources.DocumentDeclaredReference,
-                "Valor declarado na linha do documento (referência quando a pesquisa web não devolve cotação em BRL).");
+                "Valor declarado na linha do documento (referência quando a pesquisa web não devolve cotação em BRL).",
+                1,
+                0,
+                null,
+                BenchmarkPriceKind.DocumentAnchorPrice,
+                BenchmarkStatuses.DocumentAnchor,
+                0.22m,
+                0.12m,
+                new[]
+                {
+                    new BenchmarkDiagnosticEntry(
+                        "document_anchor_price",
+                        "declared_line",
+                        "Valor da linha usado como âncora (não é external_market_estimate).",
+                        rounded.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                });
             _logger.LogInformation(
-                "Referência de mercado a partir do valor declarado na linha para {ProductName}: {Price}",
-                productName, rounded);
+                "Âncora documental (document_anchor_price) para {ProductName}: {Price}; rejeições web prévias={Rejections}",
+                productName,
+                rounded,
+                lastWeb is null ? "" : string.Join(";", lastWeb.RejectionReasons));
         }
 
         if (researched is null)
@@ -92,21 +154,62 @@ public class MarketDataService : IMarketDataService
             return null;
         }
 
-        var quote = MarketPrice.Create(
-            productName.Trim(),
-            Math.Round(researched.Price, 2),
-            researched.Source);
+        var quote = MarketPrice.Create(trimmed, Math.Round(researched.Price, 2), researched.Source);
 
-        if (researched.Source != MarketPriceSources.DocumentDeclaredReference)
+        if (researched.BenchmarkKind != BenchmarkPriceKind.DocumentAnchorPrice)
             await _cacheService.SetMarketPriceAsync(quote, ct);
 
         await PersistMarketObservationAsync(quote, researched.EvidenceSnippet, ct);
 
         _logger.LogInformation(
-            "Preço obtido ({Source}) para {ProductName}: {Price:C}",
-            researched.Source, productName, researched.Price);
+            "Preço obtido ({Source}) para {ProductName}: {Price:C} (amostras={Samples}, spread={Spread:F3}, confiança={Confidence})",
+            researched.Source,
+            productName,
+            researched.Price,
+            researched.SampleCount,
+            researched.RelativeSpread,
+            ClassifyConfidence(researched));
 
-        return quote;
+        var sample = researched.SampleCount > 0 ? researched.SampleCount : (int?)null;
+        var spread = researched.RelativeSpread > 0 ? researched.RelativeSpread : (decimal?)null;
+
+        return new MarketPriceResolution(
+            quote,
+            sample,
+            spread,
+            researched.SearchQueryUsed,
+            normalizedLabel,
+            ClassifyConfidence(researched),
+            researched.BenchmarkKind,
+            researched.BenchmarkStatus,
+            researched.ConfidenceScore,
+            researched.BenchmarkQualityScore,
+            researched.Diagnostics,
+            researched.BenchmarkKind == BenchmarkPriceKind.DocumentAnchorPrice
+                ? lastWeb?.RejectionReasons
+                : null);
+    }
+
+    private static string ClassifyConfidence(MarketPriceResearchResult r)
+    {
+        if (r.BenchmarkKind == BenchmarkPriceKind.DocumentAnchorPrice)
+            return "document-anchor-only";
+
+        if (r.ConfidenceScore is { } cs)
+            return BenchmarkConfidenceCalculator.LegacyConfidenceLabel(cs, r.BenchmarkKind);
+
+        if (r.Source.Contains("SerpApi:GoogleShopping", StringComparison.OrdinalIgnoreCase)
+            && r.SampleCount >= 3
+            && r.RelativeSpread is > 0 and < 0.6m)
+            return "medium";
+
+        if (r.Source.Contains("SerpApi", StringComparison.OrdinalIgnoreCase))
+            return "low";
+
+        if (r.SampleCount >= 6 && r.RelativeSpread is > 0 and < 0.45m)
+            return "medium";
+
+        return "low";
     }
 
     private async Task PersistMarketObservationAsync(
