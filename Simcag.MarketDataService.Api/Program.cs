@@ -16,7 +16,9 @@ using Simcag.MarketDataService.Infrastructure.Messaging.Redis;
 using Simcag.MarketDataService.Infrastructure.Persistence.DbContext;
 using Simcag.MarketDataService.Infrastructure.Repositories;
 using StackExchange.Redis;
+using Simcag.Shared.ErrorHandling;
 using Simcag.Shared.Hosting;
+using Simcag.Shared.Security;
 using Simcag.Shared.Telemetry;
 
 DotNetEnv.Env.NoClobber().Load();
@@ -24,6 +26,7 @@ ContainerListenConfiguration.NormalizeAspNetCoreListenUrlsInContainer();
 var builder = WebApplication.CreateBuilder(args);
 builder.AddSimcagDistributedTelemetry("Simcag.MarketDataService");
 ContainerListenConfiguration.ApplyDockerListenUrls(builder);
+var isTesting = builder.Environment.IsEnvironment("Testing");
 
 static string? GetEnv(params string[] keys)
 {
@@ -111,7 +114,12 @@ if (string.IsNullOrWhiteSpace(connectionString))
 }
 
 builder.Services.AddDbContext<MarketDataDbContext>(options =>
-    options.UseNpgsql(connectionString));
+{
+    if (isTesting)
+        options.UseInMemoryDatabase("market-data-testing");
+    else
+        options.UseNpgsql(connectionString);
+});
 
 // Redis: se Connect falhar (nada a escutar em localhost, firewall, etc.), a API continua sem cache.
 var redisConnectionString = GetEnv("REDIS__CONNECTION", "REDIS_CONNECTION", "CONNECTIONSTRINGS__REDIS")
@@ -126,8 +134,7 @@ try
         Thread.Sleep(100);
     if (redisConnection is not null && !redisConnection.IsConnected)
     {
-        Console.Error.WriteLine(
-            "[market-data] Redis sem ligação ativa (ex.: nada a escutar em " + redisConnectionString + "). Cache desativado.");
+        Console.WriteLine("[market-data] Redis sem ligação ativa. Cache desativado.");
         try
         {
             redisConnection.Dispose();
@@ -142,8 +149,7 @@ try
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine(
-        "[market-data] Redis indisponível (" + ex.GetType().Name + ": " + ex.Message + "). Cache desativado; arranque o Redis ou corrija REDIS__CONNECTION.");
+    Console.WriteLine($"[market-data] Redis indisponível ({ex.GetType().Name}). Cache desativado.");
 }
 
 if (redisConnection is not null)
@@ -197,6 +203,7 @@ builder.Services.AddHttpClient(MarketDataHttpClients.WebScrape)
 builder.Services.AddScoped<DdgLiteMarketPriceProvider>();
 builder.Services.AddScoped<DdgHtmlMarketPriceProvider>();
 builder.Services.AddScoped<BingHtmlMarketPriceProvider>();
+builder.Services.AddScoped<BingRssMarketPriceProvider>();
 builder.Services.AddScoped<IMarketPriceResearchService, OnlineMarketPriceResearchService>();
 
 // Repositories
@@ -221,16 +228,28 @@ builder.Services.AddSingleton<IMarketDataUpdatedEventPublisher>(sp =>
 });
 
 // Health checks: Redis só se o multiplexer tiver sido criado (evita falha ao resolver o health check)
-var health = builder.Services.AddHealthChecks()
-    .AddNpgSql(connectionString, name: "PostgreSQL");
-if (redisConnection is not null)
-    health.AddRedis(EnrichRedisConnectionString(redisConnectionString), name: "Redis");
+var health = builder.Services.AddHealthChecks().AddSimcagLiveSelfCheck();
+if (!isTesting)
+{
+    health.AddNpgSql(connectionString, name: "PostgreSQL", tags: [SimcagHealthCheckExtensions.ReadyTag]);
+    if (redisConnection is not null)
+        health.AddRedis(EnrichRedisConnectionString(redisConnectionString), name: "Redis", tags: [SimcagHealthCheckExtensions.ReadyTag]);
+}
+
+builder.Services.AddSimcagGatewayAuthentication(builder.Environment);
+
+builder.Services.AddSimcagProblemDetails();
 
 var app = builder.Build();
 
+app.ValidateSimcagGatewayTrustAtStartup();
+
+app.UseSimcagExceptionHandler();
 app.UseSimcagHttpCorrelationActivityTags();
 
 // Aplica migrations no arranque (tabelas MarketPrices / MarketPriceHistory). Sem isto, PG devolve 42P01.
+if (!isTesting)
+{
 using (var scope = app.Services.CreateScope())
 {
     try
@@ -243,6 +262,7 @@ using (var scope = app.Services.CreateScope())
         app.Logger.LogError(ex, "Falha ao aplicar migrations do MarketDataDbContext.");
     }
 }
+}
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
@@ -252,11 +272,16 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+app.UseAuthentication();
 app.UseAuthorization();
 app.MapGet("/", () => Results.Redirect("/swagger"));
 app.MapControllers();
-app.MapHealthChecks("/health");
+app.MapSimcagHealthChecks();
 
 app.UseSimcagTelemetryEndpoints();
 
 app.Run();
+
+public partial class Program
+{
+}

@@ -20,6 +20,11 @@ public sealed class MarketResearchOptions
     /// </summary>
     public bool EnableBingHtmlScrape { get; set; } = true;
 
+    /// <summary>
+    /// Bing RSS (XML): snippets orgânicos com preços em BRL quando o HTML estático não traz resultados.
+    /// </summary>
+    public bool EnableBingRssScrape { get; set; } = true;
+
     /// <summary>Máximo de segundos por pedido HTTP de pesquisa.</summary>
     public int HttpTimeoutSeconds { get; set; } = 25;
 

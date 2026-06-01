@@ -190,6 +190,76 @@ public class MarketDataService : IMarketDataService
                 : null);
     }
 
+    /// <summary>
+    /// Atualiza benchmark de preço para produto já cadastrado no sistema.
+    /// Usado por cron jobs ou triggers do processing-service.
+    /// </summary>
+    public async Task<MarketPriceResolution?> UpdateBenchmarkForExistingProductAsync(
+        Guid productId, 
+        string productName, 
+        CancellationToken ct)
+    {
+        _logger.LogInformation("Atualizando benchmark para produto cadastrado: {ProductId} - {ProductName}", productId, productName);
+
+        // 1. Buscar produto cadastrado no sistema (simulação - em produção usar repository real)
+        var product = await GetProductByIdAsync(productId, ct);
+        if (product == null)
+        {
+            _logger.LogWarning("Produto com ID {ProductId} não encontrado no catálogo", productId);
+            return null;
+        }
+
+        // 2. Coletar preço apenas para este produto específico via pesquisa web
+        var researchResult = await _research.TryResolvePriceAsync(productName, ct);
+
+        // 3. Atualizar cache e persistir se houver resultado
+        if (researchResult != null)
+        {
+            // Criar MarketPrice a partir do researchResult
+            var quote = MarketPrice.Create(
+                productName, 
+                Math.Round(researchResult.Price, 2), 
+                researchResult.Source);
+
+            await _cacheService.SetMarketPriceAsync(quote, ct);
+            await PersistMarketObservationAsync(quote, researchResult.EvidenceSnippet, ct);
+
+            // 4. Atualizar produto cadastrado com novo preço de benchmark
+            product.UpdateBenchmark(researchResult.Price);
+            
+            _logger.LogInformation(
+                "Benchmark atualizado para produto {ProductId}: {ProductName} - Preço: {Price:C}",
+                productId, productName, researchResult.Price);
+
+            return new MarketPriceResolution(
+                quote,
+                researchResult.SampleCount,
+                researchResult.RelativeSpread,
+                researchResult.SearchQueryUsed,
+                productName,
+                ClassifyConfidence(researchResult),
+                researchResult.BenchmarkKind,
+                researchResult.BenchmarkStatus,
+                researchResult.ConfidenceScore,
+                researchResult.BenchmarkQualityScore,
+                researchResult.Diagnostics,
+                null);
+        }
+        else
+        {
+            _logger.LogWarning("Pesquisa de preço falhou para produto cadastrado {ProductId}: {ProductName}", productId, productName);
+            return null;
+        }
+    }
+
+    private async Task<ProductCatalogEntry?> GetProductByIdAsync(Guid productId, CancellationToken ct)
+    {
+        // Em produção, isso deve usar um repository real do ProductCatalog
+        // Atualmente retorna null para indicar que o produto não está cadastrado
+        // O processing-service deve garantir que produtos existentes estejam no catálogo antes de chamar este endpoint
+        return null;
+    }
+
     private static string ClassifyConfidence(MarketPriceResearchResult r)
     {
         if (r.BenchmarkKind == BenchmarkPriceKind.DocumentAnchorPrice)

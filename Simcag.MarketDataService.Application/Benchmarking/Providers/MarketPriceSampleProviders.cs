@@ -181,7 +181,55 @@ public sealed class BingHtmlMarketPriceProvider : IMarketPriceSampleProvider
         }
 
         var text = HtmlSnippetExtractors.BingOrganicSnippets(html, _log);
+        if (string.IsNullOrWhiteSpace(text))
+            text = HtmlSnippetExtractors.BingResultsFallbackText(html, _log);
         var samples = string.IsNullOrWhiteSpace(text) ? Array.Empty<decimal>() : BrazilianMoneyParser.ExtractAll(text);
+        return new ProviderSampleBatch(ProviderId, samples, status, samples.Count > 0 ? "ok" : "parse_empty",
+            null, false);
+    }
+}
+
+public sealed class BingRssMarketPriceProvider : IMarketPriceSampleProvider
+{
+    private readonly MarketResearchOptions _opt;
+    private readonly IHttpClientFactory _httpFactory;
+    private readonly ILogger _log;
+
+    public BingRssMarketPriceProvider(
+        Microsoft.Extensions.Options.IOptions<MarketResearchOptions> options,
+        IHttpClientFactory httpFactory,
+        ILogger<BingRssMarketPriceProvider> log)
+    {
+        _opt = options.Value;
+        _httpFactory = httpFactory;
+        _log = log;
+    }
+
+    public string ProviderId => "bing_rss";
+
+    public bool IsEnabled(MarketResearchOptions options) => options.EnableBingRssScrape;
+
+    public async Task<ProviderSampleBatch> FetchSamplesAsync(string searchQuery, CancellationToken ct)
+    {
+        if (!IsEnabled(_opt))
+            return new ProviderSampleBatch(ProviderId, Array.Empty<decimal>(), null, "disabled", null, false);
+
+        SimcagMeters.MarketDataProviderFetchAttempts.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderId),
+            new KeyValuePair<string, object?>("phase", "start"));
+
+        var client = _httpFactory.CreateClient(MarketDataHttpClients.WebScrape);
+        var url = "https://www.bing.com/search?format=rss&q=" + Uri.EscapeDataString(searchQuery)
+                  + "&cc=BR&setlang=pt-br&mkt=pt-BR";
+        var (status, xml, outcome) = await MarketScrapeHttp.GetHtmlAsync(client, url, _opt, ProviderId, _log, ct);
+        if (outcome != "ok" || string.IsNullOrEmpty(xml))
+        {
+            var detail = outcome == "http_not_success" && status is { } s ? $"status={(int)s}" : null;
+            return new ProviderSampleBatch(ProviderId, Array.Empty<decimal>(), status, outcome, detail, false);
+        }
+
+        var text = RssSnippetExtractor.ExtractItemDescriptions(xml);
+        var samples = BrazilianMoneyParser.ExtractAll(text);
         return new ProviderSampleBatch(ProviderId, samples, status, samples.Count > 0 ? "ok" : "parse_empty",
             null, false);
     }

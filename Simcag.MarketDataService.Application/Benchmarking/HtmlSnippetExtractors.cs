@@ -80,4 +80,29 @@ internal static class HtmlSnippetExtractors
             return string.Empty;
         }
     }
+
+    /// <summary>Fallback quando Bing deixa de emitir <c>li.b_algo</c> no HTML estático (resultados via JS).</summary>
+    public static string BingResultsFallbackText(string html, ILogger log)
+    {
+        try
+        {
+            var doc = new HtmlParser().ParseDocument(html);
+            var block = doc.QuerySelector("#b_results");
+            if (block is not null)
+            {
+                var text = block.TextContent ?? string.Empty;
+                if (text.Length > 80)
+                    return text;
+            }
+        }
+        catch (Exception ex)
+        {
+            SimcagMeters.MarketDataScrapeParseErrors.Add(1,
+                new KeyValuePair<string, object?>("stage", "bing_html_fallback"),
+                new KeyValuePair<string, object?>("exception", ex.GetType().Name));
+            log.LogDebug(ex, "Fallback #b_results Bing indisponível");
+        }
+
+        return string.Empty;
+    }
 }

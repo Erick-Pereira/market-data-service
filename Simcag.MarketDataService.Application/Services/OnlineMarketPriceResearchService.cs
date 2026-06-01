@@ -35,12 +35,13 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         ILogger<OnlineMarketPriceResearchService> log,
         DdgLiteMarketPriceProvider ddgLite,
         DdgHtmlMarketPriceProvider ddgHtml,
-        BingHtmlMarketPriceProvider bingHtml)
+        BingHtmlMarketPriceProvider bingHtml,
+        BingRssMarketPriceProvider bingRss)
     {
         _opt = options.Value;
         _httpFactory = httpFactory;
         _log = log;
-        _sampleProviders = new IMarketPriceSampleProvider[] { ddgLite, ddgHtml, bingHtml };
+        _sampleProviders = new IMarketPriceSampleProvider[] { bingRss, ddgLite, ddgHtml, bingHtml };
     }
 
     public async Task<MarketPriceResearchResult?> TryResolvePriceAsync(
@@ -69,9 +70,20 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         root?.SetTag("marketdata.query.length", productQuery.Trim().Length);
         var sw = Stopwatch.StartNew();
 
-        var q = BuildSearchQuery(productQuery.Trim());
+        var queries = MarketSearchQueryBuilder.BuildVariants(productQuery.Trim());
+        ProviderSampleBatch[] batches = Array.Empty<ProviderSampleBatch>();
+        string q = queries[0];
+        var merged = new List<decimal>();
 
-        var batches = await Task.WhenAll(_sampleProviders.Select(p => p.FetchSamplesAsync(q, cancellationToken)));
+        foreach (var candidate in queries)
+        {
+            q = candidate;
+            batches = await Task.WhenAll(_sampleProviders.Select(p => p.FetchSamplesAsync(q, cancellationToken)));
+            merged = batches.SelectMany(b => b.Samples).ToList();
+            if (merged.Count > 0)
+                break;
+        }
+
         foreach (var b in batches)
         {
             diagnostics.Add(new BenchmarkDiagnosticEntry(
@@ -81,15 +93,14 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
                 b.Detail));
         }
 
-        var merged = batches.SelectMany(b => b.Samples).ToList();
         var antiBot = batches.Any(b => b.AntiBotLikely);
 
         if (merged.Count > 0)
         {
             var fromAgg = BuildFromExtracted(
                 merged,
-                "WebScrape:Aggregated(DDG+Bing)",
-                "Consolidação de valores em BRL extraídos dos snippets DuckDuckGo e Bing.",
+                "WebScrape:Aggregated(BingRSS+DDG+Bing)",
+                "Consolidação de valores em BRL extraídos de RSS/HTML DuckDuckGo e Bing.",
                 q,
                 structuredPriceList: false,
                 antiBotLikely: antiBot,
@@ -115,7 +126,8 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         {
             using (SimcagActivitySources.MarketData.StartActivity("marketdata.serpapi", ActivityKind.Client))
             {
-                var fromSerp = await TrySerpApiAsync(q, diagnostics, rejections, cancellationToken);
+                var serpQuery = queries.Count > 0 ? queries[0] : productQuery.Trim();
+                var fromSerp = await TrySerpApiAsync(serpQuery, diagnostics, rejections, cancellationToken);
                 if (fromSerp is not null)
                 {
                     RecordBenchmarkEnd(sw, success: true, source: "serp");
@@ -155,12 +167,6 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         else
             SimcagMeters.MarketDataBenchmarkEmpty.Add(1, new KeyValuePair<string, object?>("source", source));
     }
-
-    private static string BuildSearchQuery(string raw) =>
-        raw.Contains("preço", StringComparison.OrdinalIgnoreCase) ||
-        raw.Contains("preco", StringComparison.OrdinalIgnoreCase)
-            ? raw + " Brasil"
-            : raw + " preço Brasil";
 
     private MarketPriceResearchResult? BuildFromExtracted(
         IReadOnlyList<decimal> extracted,
