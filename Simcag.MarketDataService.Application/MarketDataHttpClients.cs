@@ -4,5 +4,6 @@ namespace Simcag.MarketDataService.Application;
 public static class MarketDataHttpClients
 {
     public const string WebScrape = "MarketDataWebScrape";
+    public const string Searxng = "MarketDataSearxng";
     public const string Serp = "MarketDataSerpApi";
 }

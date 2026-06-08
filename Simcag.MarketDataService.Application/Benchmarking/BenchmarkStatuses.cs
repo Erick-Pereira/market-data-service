@@ -10,5 +10,6 @@ public static class BenchmarkStatuses
     public const string RejectedSpread = "rejected_spread";
     public const string RejectedInsufficientSamples = "rejected_insufficient_samples";
     public const string RejectedDistinctSamples = "rejected_distinct_samples_policy";
+    public const string RejectedDeclaredMismatch = "rejected_declared_mismatch";
     public const string Empty = "empty";
 }

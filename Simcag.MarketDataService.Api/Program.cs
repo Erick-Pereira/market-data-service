@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Simcag.MarketDataService.Application;
+using Simcag.MarketDataService.Application.Benchmarking;
 using Simcag.MarketDataService.Application.Benchmarking.Providers;
 using Simcag.MarketDataService.Application.Cache;
 using Simcag.MarketDataService.Application.Classification;
@@ -18,6 +19,10 @@ using Simcag.MarketDataService.Infrastructure.Repositories;
 using StackExchange.Redis;
 using Simcag.Shared.ErrorHandling;
 using Simcag.Shared.Hosting;
+using Simcag.Shared.Messaging.Configuration;
+using Simcag.Shared.Messaging.Extensions;
+using Simcag.Shared.Messaging.Rpc;
+using Simcag.Shared.Messaging.Rpc.Contracts;
 using Simcag.Shared.Security;
 using Simcag.Shared.Telemetry;
 
@@ -166,9 +171,22 @@ builder.Services.AddSingleton<IRuleBasedExpenseCategoryClassifier, RuleBasedExpe
 
 builder.Services.Configure<MarketResearchOptions>(o =>
 {
+    var searxRaw = GetEnv("MARKET_DATA__SEARXNG_BASE_URL", "SEARXNG_BASE_URL");
+    if (searxRaw is null)
+        o.SearxngBaseUrl = "http://localhost:8088";
+    else if (string.IsNullOrWhiteSpace(searxRaw))
+        o.SearxngBaseUrl = null;
+    else
+        o.SearxngBaseUrl = searxRaw.Trim();
+    o.EnableSearxngScrape = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_SEARXNG_SCRAPE"), defaultValue: true);
     o.SerpApiKey = GetEnv("MARKET_DATA__SERPAPI_API_KEY", "SERPAPI_API_KEY");
+    o.EnableSerpApiFallback = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_SERPAPI"), defaultValue: false);
+    o.EnableCuratedCategoryBenchmark = ParseBoolEnv(
+        GetEnv("MARKET_DATA__ENABLE_CURATED_BENCHMARK"),
+        defaultValue: true);
     o.EnableDuckDuckGoLiteScrape = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_DDG_LITE_SCRAPE"), defaultValue: true);
     o.EnableBingHtmlScrape = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_BING_HTML_SCRAPE"), defaultValue: true);
+    o.EnableBingRssScrape = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_BING_RSS_SCRAPE"), defaultValue: true);
     if (int.TryParse(GetEnv("MARKET_DATA__HTTP_TIMEOUT_SECONDS"), out var timeout) && timeout > 0)
         o.HttpTimeoutSeconds = timeout;
     if (int.TryParse(GetEnv("MARKET_DATA__MINIMUM_PRICE_SAMPLES_WEB_SCRAPE"), out var minWs) && minWs >= 1)
@@ -180,6 +198,10 @@ builder.Services.Configure<MarketResearchOptions>(o =>
     o.RequireDistinctSamplesForWebScrape = ParseBoolEnv(
         GetEnv("MARKET_DATA__REQUIRE_DISTINCT_SAMPLES_WEB_SCRAPE"),
         defaultValue: false);
+    if (int.TryParse(GetEnv("MARKET_DATA__SEARXNG_CONNECT_TIMEOUT_SECONDS"), out var sct) && sct > 0)
+        o.SearxngConnectTimeoutSeconds = sct;
+    if (int.TryParse(GetEnv("MARKET_DATA__SEARXNG_COOLDOWN_MINUTES"), out var scm) && scm >= 1)
+        o.SearxngUnavailableCooldownMinutes = scm;
 });
 
 builder.Services.AddHttpClient(MarketDataHttpClients.Serp)
@@ -200,6 +222,27 @@ builder.Services.AddHttpClient(MarketDataHttpClients.WebScrape)
         client.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://duckduckgo.com/");
     });
 
+builder.Services.AddHttpClient(MarketDataHttpClients.Searxng)
+    .ConfigurePrimaryHttpMessageHandler(sp =>
+    {
+        var o = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<MarketResearchOptions>>().Value;
+        return new SocketsHttpHandler
+        {
+            ConnectTimeout = TimeSpan.FromSeconds(Math.Max(1, o.SearxngConnectTimeoutSeconds)),
+        };
+    })
+    .ConfigureHttpClient((sp, client) =>
+    {
+        var o = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<MarketResearchOptions>>().Value;
+        client.Timeout = TimeSpan.FromSeconds(Math.Max(3, o.SearxngConnectTimeoutSeconds + 3));
+        client.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
+        client.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "pt-BR,pt;q=0.9");
+    });
+
+builder.Services.AddSingleton<SearxngAvailabilityGate>();
+builder.Services.AddHostedService<SearxngStartupHostedService>();
+builder.Services.AddHostedService<CuratedBenchmarkSeedHostedService>();
+builder.Services.AddScoped<SearxngMarketPriceProvider>();
 builder.Services.AddScoped<DdgLiteMarketPriceProvider>();
 builder.Services.AddScoped<DdgHtmlMarketPriceProvider>();
 builder.Services.AddScoped<BingHtmlMarketPriceProvider>();
@@ -213,6 +256,45 @@ builder.Services.AddScoped<IMarketPriceHistoryRepository, MarketPriceHistoryRepo
 // Services
 builder.Services.AddScoped<IMarketDataService, MarketDataService>();
 builder.Services.AddScoped<IMarketBenchmarkQuery, MarketBenchmarkQueryService>();
+
+if (!isTesting)
+{
+    var rabbitMqOptions = new RabbitMqOptions
+    {
+        Host = GetEnv("RABBITMQ__HOST", "RABBITMQ_HOST") ?? "localhost",
+        Port = int.Parse(GetEnv("RABBITMQ__PORT", "RABBITMQ_PORT") ?? "5672"),
+        UserName = GetEnv("RABBITMQ__USERNAME", "RABBITMQ_USERNAME") ?? "guest",
+        Password = GetEnv("RABBITMQ__PASSWORD", "RABBITMQ_PASSWORD") ?? "guest",
+        VirtualHost = GetEnv("RABBITMQ__VIRTUALHOST", "RABBITMQ_VIRTUALHOST") ?? "/"
+    };
+    rabbitMqOptions.ApplyMessageSigningFromEnvironment();
+    builder.Services.AddRabbitMqMessaging(rabbitMqOptions);
+
+    builder.Services.AddRabbitMqRpcHandler<GetMarketPriceRpcRequest, GetMarketPriceRpcResponse>(
+        RpcQueues.MarketDataGetPrice,
+        async (sp, request, ct) =>
+        {
+            var marketData = sp.GetRequiredService<IMarketDataService>();
+            var name = request.ProductName?.Trim();
+            if (string.IsNullOrWhiteSpace(name))
+                return new GetMarketPriceRpcResponse { Found = false };
+
+            var resolution = await marketData.ResolvePriceAsync(name, ct, request.DeclaredReferenceBrl);
+            if (resolution is null)
+                return new GetMarketPriceRpcResponse { Found = false };
+
+            var quote = resolution.Quote;
+            return new GetMarketPriceRpcResponse
+            {
+                Found = true,
+                ProductName = quote.ProductName,
+                Price = quote.Price,
+                Source = quote.Source,
+                BenchmarkKind = resolution.BenchmarkKind.ToString(),
+                BenchmarkStatus = resolution.BenchmarkStatus,
+            };
+        });
+}
 
 builder.Services.AddSingleton<IMarketDataUpdatedEventPublisher>(sp =>
 {

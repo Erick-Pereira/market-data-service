@@ -1,6 +1,7 @@
 using System.Net;
 using Microsoft.Extensions.Logging;
 using Simcag.MarketDataService.Application;
+using Simcag.MarketDataService.Application.Benchmarking;
 using Simcag.MarketDataService.Application.Configuration;
 using Simcag.MarketDataService.Application.Services;
 using Simcag.Shared.Telemetry;
@@ -23,6 +24,78 @@ public sealed record ProviderSampleBatch(
     string Outcome,
     string? Detail,
     bool AntiBotLikely);
+
+public sealed class SearxngMarketPriceProvider : IMarketPriceSampleProvider
+{
+    private readonly MarketResearchOptions _opt;
+    private readonly IHttpClientFactory _httpFactory;
+    private readonly SearxngAvailabilityGate _gate;
+    private readonly ILogger _log;
+
+    public SearxngMarketPriceProvider(
+        Microsoft.Extensions.Options.IOptions<MarketResearchOptions> options,
+        IHttpClientFactory httpFactory,
+        SearxngAvailabilityGate gate,
+        ILogger<SearxngMarketPriceProvider> log)
+    {
+        _opt = options.Value;
+        _httpFactory = httpFactory;
+        _gate = gate;
+        _log = log;
+    }
+
+    public string ProviderId => "searxng";
+
+    public bool IsEnabled(MarketResearchOptions options) =>
+        options.EnableSearxngScrape && !string.IsNullOrWhiteSpace(options.SearxngBaseUrl);
+
+    public async Task<ProviderSampleBatch> FetchSamplesAsync(string searchQuery, CancellationToken ct)
+    {
+        if (!IsEnabled(_opt))
+            return new ProviderSampleBatch(ProviderId, Array.Empty<decimal>(), null, "disabled", null, false);
+
+        if (!_gate.IsAvailable)
+            return new ProviderSampleBatch(ProviderId, Array.Empty<decimal>(), null, "circuit_open", "searxng_cooldown", false);
+
+        var baseUrl = _opt.SearxngBaseUrl!.Trim().TrimEnd('/');
+        SimcagMeters.MarketDataProviderFetchAttempts.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderId),
+            new KeyValuePair<string, object?>("phase", "start"));
+
+        var client = _httpFactory.CreateClient(MarketDataHttpClients.Searxng);
+        var url = baseUrl + "/search?q=" + Uri.EscapeDataString(searchQuery)
+                  + "&format=json&language=pt-BR&categories=general";
+        var (status, body, outcome) = await MarketScrapeHttp.GetHtmlAsync(
+            client, url, _opt, ProviderId, _log, ct, maxRetriesOverride: 0);
+        if (outcome != "ok" || string.IsNullOrEmpty(body))
+        {
+            if (outcome == "connection_refused")
+            {
+                _gate.MarkUnavailable(TimeSpan.FromMinutes(Math.Max(1, _opt.SearxngUnavailableCooldownMinutes)));
+                if (_gate.TryLogStartupWarningOnce())
+                {
+                    _log.LogWarning(
+                        "SearXNG indisponível em {BaseUrl}. Pesquisa continua via DDG/Bing. Suba: docker compose -f docker-compose.dev.yml up -d searxng",
+                        baseUrl);
+                }
+            }
+
+            var detail = outcome switch
+            {
+                "http_not_success" when status is { } s => $"status={(int)s}",
+                "connection_refused" => "searxng_unreachable",
+                _ => outcome
+            };
+            return new ProviderSampleBatch(ProviderId, Array.Empty<decimal>(), status, outcome, detail, false);
+        }
+
+        _gate.MarkAvailable();
+        var text = SearxngJsonParser.ExtractResultText(body);
+        var samples = BrazilianMoneyParser.ExtractAll(text);
+        return new ProviderSampleBatch(ProviderId, samples, status, samples.Count > 0 ? "ok" : "parse_empty",
+            null, false);
+    }
+}
 
 public sealed class DdgLiteMarketPriceProvider : IMarketPriceSampleProvider
 {

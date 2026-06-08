@@ -10,13 +10,17 @@ public interface IMarketPriceResearchService
 {
     /// <param name="productQuery">Termo de busca (ex.: descrição da linha de despesa).</param>
     /// <returns>Preço mediano/plausível extraído de resultados reais, ou null.</returns>
-    Task<MarketPriceResearchResult?> TryResolvePriceAsync(string productQuery, CancellationToken cancellationToken = default);
+    Task<MarketPriceResearchResult?> TryResolvePriceAsync(
+        string productQuery,
+        decimal? declaredReferenceBrl = null,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Igual a <see cref="TryResolvePriceAsync"/> mas inclui rejeições e diagnósticos para auditoria.
     /// </summary>
     Task<MarketPriceResearchDetailedOutcome> TryResolvePriceDetailedAsync(
         string productQuery,
+        decimal? declaredReferenceBrl = null,
         CancellationToken cancellationToken = default);
 }
 

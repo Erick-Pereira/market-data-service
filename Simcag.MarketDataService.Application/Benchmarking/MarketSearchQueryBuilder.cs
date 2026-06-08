@@ -82,7 +82,22 @@ internal static class MarketSearchQueryBuilder
             yield return "serviço limpeza condomínio preço mensal Brasil";
         if (u.Contains("SEGURAN", StringComparison.Ordinal) || u.Contains("PORTARIA", StringComparison.Ordinal))
             yield return "serviço portaria condomínio preço mensal Brasil";
+        if (u.Contains("CAMERA", StringComparison.Ordinal) || u.Contains("CÂMERA", StringComparison.Ordinal)
+            || u.Contains("CFTV", StringComparison.Ordinal))
+            yield return "câmera IP 2MP preço Brasil mercado livre";
+        if (u.Contains("NVR", StringComparison.Ordinal))
+            yield return "NVR 16 canais IP preço Brasil";
         if (u.Contains("DETERGENTE", StringComparison.Ordinal))
             yield return "detergente 5 litros preço Brasil";
+        if (LooksLikeRetailProduct(text))
+            yield return CompactForSearch(text) + " preço site:mercadolivre.com.br";
+    }
+
+    private static bool LooksLikeRetailProduct(string text)
+    {
+        var u = text.ToUpperInvariant();
+        return u.Contains("CAMERA", StringComparison.Ordinal) || u.Contains("NVR", StringComparison.Ordinal)
+               || u.Contains("SWITCH", StringComparison.Ordinal) || u.Contains("ROTEADOR", StringComparison.Ordinal)
+               || u.Contains("HD EXTERNO", StringComparison.Ordinal) || u.Contains("SSD", StringComparison.Ordinal);
     }
 }

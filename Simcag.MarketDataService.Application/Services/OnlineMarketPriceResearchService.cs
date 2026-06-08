@@ -13,7 +13,7 @@ using Simcag.Shared.Telemetry;
 namespace Simcag.MarketDataService.Application.Services;
 
 /// <summary>
-/// Orquestra providers de amostragem (DDG/Bing), agregação com mediana e SerpAPI opcional.
+/// Orquestra providers de amostragem (SearXNG self-hosted, DDG/Bing), agregação com mediana e SerpAPI opt-in.
 /// </summary>
 public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchService
 {
@@ -33,6 +33,7 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         IOptions<MarketResearchOptions> options,
         IHttpClientFactory httpFactory,
         ILogger<OnlineMarketPriceResearchService> log,
+        SearxngMarketPriceProvider searxng,
         DdgLiteMarketPriceProvider ddgLite,
         DdgHtmlMarketPriceProvider ddgHtml,
         BingHtmlMarketPriceProvider bingHtml,
@@ -41,19 +42,21 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         _opt = options.Value;
         _httpFactory = httpFactory;
         _log = log;
-        _sampleProviders = new IMarketPriceSampleProvider[] { bingRss, ddgLite, ddgHtml, bingHtml };
+        _sampleProviders = new IMarketPriceSampleProvider[] { searxng, bingRss, ddgLite, ddgHtml, bingHtml };
     }
 
     public async Task<MarketPriceResearchResult?> TryResolvePriceAsync(
         string productQuery,
+        decimal? declaredReferenceBrl = null,
         CancellationToken cancellationToken = default)
     {
-        var d = await TryResolvePriceDetailedAsync(productQuery, cancellationToken);
+        var d = await TryResolvePriceDetailedAsync(productQuery, declaredReferenceBrl, cancellationToken);
         return d.Result;
     }
 
     public async Task<MarketPriceResearchDetailedOutcome> TryResolvePriceDetailedAsync(
         string productQuery,
+        decimal? declaredReferenceBrl = null,
         CancellationToken cancellationToken = default)
     {
         var rejections = new List<string>();
@@ -79,7 +82,18 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         {
             q = candidate;
             batches = await Task.WhenAll(_sampleProviders.Select(p => p.FetchSamplesAsync(q, cancellationToken)));
-            merged = batches.SelectMany(b => b.Samples).ToList();
+            var rawMerged = batches.SelectMany(b => b.Samples).ToList();
+            merged = DeclaredReferencePlausibility.FilterSamples(rawMerged, declaredReferenceBrl).ToList();
+            if (rawMerged.Count > 0 && merged.Count == 0)
+            {
+                rejections.Add(BenchmarkStatuses.RejectedDeclaredMismatch);
+                diagnostics.Add(new BenchmarkDiagnosticEntry(
+                    "orchestrator",
+                    "plausibility",
+                    "Amostras web filtradas por incompatibilidade com declarado",
+                    $"raw={rawMerged.Count}"));
+            }
+
             if (merged.Count > 0)
                 break;
         }
@@ -99,13 +113,23 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         {
             var fromAgg = BuildFromExtracted(
                 merged,
-                "WebScrape:Aggregated(BingRSS+DDG+Bing)",
+                "WebScrape:Aggregated(SearXNG+BingRSS+DDG+Bing)",
                 "Consolidação de valores em BRL extraídos de RSS/HTML DuckDuckGo e Bing.",
                 q,
                 structuredPriceList: false,
                 antiBotLikely: antiBot,
                 rejections);
-            if (fromAgg is not null)
+            if (fromAgg is not null
+                && declaredReferenceBrl is > 0.01m
+                && !DeclaredReferencePlausibility.IsPlausible(fromAgg.Price, declaredReferenceBrl.Value))
+            {
+                rejections.Add(BenchmarkStatuses.RejectedDeclaredMismatch);
+                _log.LogInformation(
+                    "Cotação web rejeitada: mediana {Median} incompatível com declarado {Declared}",
+                    fromAgg.Price,
+                    declaredReferenceBrl);
+            }
+            else if (fromAgg is not null)
             {
                 RecordBenchmarkEnd(sw, success: true, source: "web_scrape");
                 return new MarketPriceResearchDetailedOutcome(
@@ -122,7 +146,7 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
                 new KeyValuePair<string, object?>("stage", "aggregate"));
         }
 
-        if (!string.IsNullOrWhiteSpace(_opt.SerpApiKey))
+        if (_opt.EnableSerpApiFallback && !string.IsNullOrWhiteSpace(_opt.SerpApiKey))
         {
             using (SimcagActivitySources.MarketData.StartActivity("marketdata.serpapi", ActivityKind.Client))
             {
@@ -140,9 +164,10 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         }
         else
         {
-            diagnostics.Add(new BenchmarkDiagnosticEntry("serpapi", "config", "SerpAPI omitida (sem chave)", null));
+            diagnostics.Add(new BenchmarkDiagnosticEntry("serpapi", "config",
+                _opt.EnableSerpApiFallback ? "SerpAPI omitida (sem chave)" : "SerpAPI desligada (opt-in pago)", null));
             _log.LogDebug(
-                "SerpAPI não configurada (MARKET_DATA__SERPAPI_API_KEY / SERPAPI_API_KEY vazio); fallback pago omitido.");
+                "SerpAPI omitida (MARKET_DATA__ENABLE_SERPAPI=false ou chave vazia); sem fallback pago.");
         }
 
         if (rejections.Count == 0)

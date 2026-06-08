@@ -16,6 +16,15 @@ public sealed class MarketSearchQueryBuilderTests
     }
 
     [Fact]
+    public void BuildVariants_inclui_fallback_camera_e_mercado_livre()
+    {
+        var variants = MarketSearchQueryBuilder.BuildVariants("Camera IP Full HD 2MP bullet");
+
+        Assert.Contains(variants, v => v.Contains("câmera IP", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(variants, v => v.Contains("mercadolivre.com.br", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void RssSnippetExtractor_encontra_preco_em_item()
     {
         const string rss = """

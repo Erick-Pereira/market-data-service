@@ -2,13 +2,33 @@ namespace Simcag.MarketDataService.Application.Configuration;
 
 /// <summary>
 /// Pesquisa de preços em fontes públicas na web (sem valores inventados).
-/// Caminho padrão: HTTP local para páginas HTML públicas (DuckDuckGo lite, Bing) e mediana de menções a R$.
-/// SerpAPI é opcional e só é usado como último recurso se uma chave estiver configurada.
+/// Caminho padrão: SearXNG self-hosted (se configurado) + scraping HTML (DDG/Bing) e mediana de menções a R$.
+/// SerpAPI é opt-in explícito (serviço pago) — desligado por defeito.
 /// </summary>
 public sealed class MarketResearchOptions
 {
-    /// <summary>Chave opcional SerpAPI — só usada se não vazia, após tentativas de scraping local.</summary>
+    /// <summary>
+    /// URL base do SearXNG local (ex. http://localhost:8088). Vazio desliga o provider.
+    /// </summary>
+    public string? SearxngBaseUrl { get; set; } = "http://localhost:8088";
+
+    /// <summary>Usa SearXNG JSON API como provider principal (requer instância acessível).</summary>
+    public bool EnableSearxngScrape { get; set; } = true;
+
+    /// <summary>Cooldown após connection refused antes de voltar a tentar SearXNG.</summary>
+    public int SearxngUnavailableCooldownMinutes { get; set; } = 5;
+
+    /// <summary>Timeout de ligação TCP ao SearXNG local (segundos).</summary>
+    public int SearxngConnectTimeoutSeconds { get; set; } = 2;
+
+    /// <summary>Chave SerpAPI — só usada se <see cref="EnableSerpApiFallback"/> estiver ativo.</summary>
     public string? SerpApiKey { get; set; }
+
+    /// <summary>Fallback pago SerpAPI — requer MARKET_DATA__ENABLE_SERPAPI=true e chave configurada.</summary>
+    public bool EnableSerpApiFallback { get; set; }
+
+    /// <summary>Benchmarks curados por categoria (sem API externa) quando web falha ou é implausível.</summary>
+    public bool EnableCuratedCategoryBenchmark { get; set; } = true;
 
     /// <summary>
     /// DuckDuckGo lite (HTML): extrai texto dos resultados e interpreta valores em BRL.

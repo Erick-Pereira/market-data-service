@@ -1,7 +1,9 @@
 using System.Linq;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Simcag.MarketDataService.Application.Benchmarking;
 using Simcag.MarketDataService.Application.Classification;
+using Simcag.MarketDataService.Application.Configuration;
 using Simcag.MarketDataService.Application.DTOs;
 using Simcag.MarketDataService.Application.Interfaces;
 using Simcag.MarketDataService.Domain.Entities;
@@ -29,6 +31,7 @@ public class MarketDataService : IMarketDataService
     private readonly IMarketPriceHistoryRepository _historyRepository;
     private readonly IMarketPriceResearchService _research;
     private readonly IRuleBasedExpenseCategoryClassifier _classifier;
+    private readonly MarketResearchOptions _researchOptions;
 
     public MarketDataService(
         ILogger<MarketDataService> logger,
@@ -36,7 +39,8 @@ public class MarketDataService : IMarketDataService
         IMarketPriceRepository repository,
         IMarketPriceHistoryRepository historyRepository,
         IMarketPriceResearchService research,
-        IRuleBasedExpenseCategoryClassifier classifier)
+        IRuleBasedExpenseCategoryClassifier classifier,
+        IOptions<MarketResearchOptions> researchOptions)
     {
         _logger = logger;
         _cacheService = cacheService;
@@ -44,6 +48,7 @@ public class MarketDataService : IMarketDataService
         _historyRepository = historyRepository;
         _research = research;
         _classifier = classifier;
+        _researchOptions = researchOptions.Value;
     }
 
     private static string ClampPersistedSource(string text)
@@ -85,10 +90,18 @@ public class MarketDataService : IMarketDataService
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
+        MarketPrice? staleExternalCandidate = null;
+
         foreach (var searchName in searchNames)
         {
             var fromDb = await _repository.GetByProductNameAsync(searchName, ct);
-            if (fromDb is not null)
+            if (fromDb is null)
+                continue;
+
+            if (StoredMarketPricePolicy.IsExternalBenchmarkSource(fromDb.Source))
+                staleExternalCandidate ??= fromDb;
+
+            if (!StoredMarketPricePolicy.ShouldRefresh(declaredReferenceBrl, fromDb))
             {
                 var result = MarketPrice.Create(fromDb.ProductName, Math.Round(fromDb.Price, 2), "PostgreSQL");
                 await _cacheService.SetMarketPriceAsync(result, ct);
@@ -102,18 +115,70 @@ public class MarketDataService : IMarketDataService
                     BenchmarkPriceKind.ExternalMarketEstimate,
                     BenchmarkStatuses.DatabaseHit);
             }
+
+            _logger.LogInformation(
+                "Preço em PostgreSQL ignorado para {ProductName} ({StoredPrice} vs declarado {Declared}); tentando pesquisa web.",
+                searchName,
+                fromDb.Price,
+                declaredReferenceBrl);
         }
 
         MarketPriceResearchDetailedOutcome? lastWeb = null;
         MarketPriceResearchResult? researched = null;
         foreach (var query in searchNames)
         {
-            lastWeb = await _research.TryResolvePriceDetailedAsync(query, ct);
+            lastWeb = await _research.TryResolvePriceDetailedAsync(query, declaredReferenceBrl, ct);
             if (lastWeb.Result is not null)
             {
                 researched = lastWeb.Result;
                 break;
             }
+        }
+
+        if (researched is null && _researchOptions.EnableCuratedCategoryBenchmark)
+        {
+            researched = TryCuratedCategoryBenchmark(trimmed, declaredReferenceBrl);
+            if (researched is not null)
+            {
+                _logger.LogInformation(
+                    "Benchmark curado para {ProductName}: {Price:C} ({Source})",
+                    productName,
+                    researched.Price,
+                    researched.Source);
+            }
+        }
+
+        if (researched is null
+            && staleExternalCandidate is not null
+            && declaredReferenceBrl is > 0.01m
+            && StoredMarketPricePolicy.ShouldRefresh(declaredReferenceBrl, staleExternalCandidate))
+        {
+            var stalePrice = Math.Round(staleExternalCandidate.Price, 2);
+            researched = new MarketPriceResearchResult(
+                stalePrice,
+                ClampPersistedSource($"PostgreSQL:StaleFallback({staleExternalCandidate.Source})"),
+                "Benchmark externo anterior em PostgreSQL (pesquisa web indisponível ou bloqueada).",
+                1,
+                0,
+                null,
+                BenchmarkPriceKind.ExternalMarketEstimate,
+                BenchmarkStatuses.DatabaseHit,
+                0.35m,
+                0.25m,
+                new[]
+                {
+                    new BenchmarkDiagnosticEntry(
+                        "stale_external_fallback",
+                        "postgresql",
+                        "Web scrape sem amostras; reutilizando cotação externa divergente do declarado.",
+                        stalePrice.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                });
+            _logger.LogWarning(
+                "Fallback PostgreSQL (stale external) para {ProductName}: {StoredPrice} vs declarado {Declared}; rejeições web={Rejections}",
+                productName,
+                stalePrice,
+                declaredReferenceBrl,
+                lastWeb is null ? "" : string.Join(";", lastWeb.RejectionReasons));
         }
 
         if (researched is null
@@ -210,7 +275,7 @@ public class MarketDataService : IMarketDataService
         }
 
         // 2. Coletar preço apenas para este produto específico via pesquisa web
-        var researchResult = await _research.TryResolvePriceAsync(productName, ct);
+        var researchResult = await _research.TryResolvePriceAsync(productName, declaredReferenceBrl: null, ct);
 
         // 3. Atualizar cache e persistir se houver resultado
         if (researchResult != null)
@@ -282,11 +347,43 @@ public class MarketDataService : IMarketDataService
         return "low";
     }
 
+    private static MarketPriceResearchResult? TryCuratedCategoryBenchmark(
+        string productName,
+        decimal? declaredReferenceBrl)
+    {
+        var match = CuratedCategoryBenchmarkCatalog.TryMatch(productName, declaredReferenceBrl);
+        if (match is null)
+            return null;
+
+        return new MarketPriceResearchResult(
+            Math.Round(match.ReferencePriceBrl, 2),
+            $"{CuratedCategoryBenchmarkCatalog.SourcePrefix}:{match.PatternId}",
+            match.EvidenceSnippet,
+            1,
+            0,
+            null,
+            BenchmarkPriceKind.ExternalMarketEstimate,
+            BenchmarkStatuses.DatabaseHit,
+            0.45m,
+            0.40m,
+            new[]
+            {
+                new BenchmarkDiagnosticEntry(
+                    "curated_catalog",
+                    "pattern_match",
+                    match.PatternId,
+                    match.Category)
+            });
+    }
+
     private async Task PersistMarketObservationAsync(
         MarketPrice quote,
         string? evidenceSnippet,
         CancellationToken ct)
     {
+        if (StoredMarketPricePolicy.IsDocumentAnchorSource(quote.Source))
+            return;
+
         try
         {
             var name = quote.ProductName;

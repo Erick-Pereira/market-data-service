@@ -22,6 +22,9 @@ public sealed class RuleBasedExpenseCategoryClassifier : IRuleBasedExpenseCatego
         if (name.Contains("fundo de reserva", StringComparison.Ordinal) || name.Contains("condom", StringComparison.Ordinal))
             return "Condomínio";
 
+        if (Regex.IsMatch(name, @"\b(camera|câmera|nvr|cftv)\b", RegexOptions.IgnoreCase))
+            return "Segurança Eletrônica";
+
         // Eletrónica — só com limite de palavra para não apanhar substrings em "manutenção", etc.
         if (Regex.IsMatch(name, @"\b(notebook|laptop)\b", RegexOptions.IgnoreCase))
             return "Notebook";

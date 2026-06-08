@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using Simcag.MarketDataService.Application.Configuration;
 using Simcag.Shared.Telemetry;
@@ -16,9 +17,10 @@ internal static class MarketScrapeHttp
         MarketResearchOptions opt,
         string providerId,
         ILogger log,
-        CancellationToken ct)
+        CancellationToken ct,
+        int? maxRetriesOverride = null)
     {
-        var max = Math.Max(0, opt.ScrapeMaxRetries);
+        var max = maxRetriesOverride ?? Math.Max(0, opt.ScrapeMaxRetries);
         Exception? lastEx = null;
         for (var attempt = 0; attempt <= max; attempt++)
         {
@@ -71,6 +73,11 @@ internal static class MarketScrapeHttp
 
                 var html = await resp.Content.ReadAsStringAsync(ct);
                 return (code, html, "ok");
+            }
+            catch (Exception ex) when (IsConnectionRefused(ex))
+            {
+                log.LogDebug(ex, "Conexão recusada provider={Provider}", providerId);
+                return (null, null, "connection_refused");
             }
             catch (Exception ex) when (ex is OperationCanceledException && !ct.IsCancellationRequested)
             {
@@ -132,5 +139,16 @@ internal static class MarketScrapeHttp
         SimcagMeters.MarketDataScrapeHttpErrors.Add(1,
             new KeyValuePair<string, object?>("source", providerId),
             new KeyValuePair<string, object?>("status_code", statusCode));
+    }
+
+    private static bool IsConnectionRefused(Exception ex)
+    {
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is SocketException { SocketErrorCode: SocketError.ConnectionRefused })
+                return true;
+        }
+
+        return false;
     }
 }
