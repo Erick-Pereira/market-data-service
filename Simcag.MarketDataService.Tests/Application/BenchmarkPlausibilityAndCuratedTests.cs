@@ -1,7 +1,7 @@
 using Simcag.MarketDataService.Application.Benchmarking;
 using Simcag.MarketDataService.Application.Interfaces;
 using Simcag.MarketDataService.Domain.Entities;
-using NSubstitute;
+using Moq;
 
 namespace Simcag.MarketDataService.Tests.Application;
 
@@ -54,16 +54,16 @@ public sealed class HistoricalPriceBenchmarkResolverTests
     [Fact]
     public async Task TryResolveAsync_uses_median_of_history_excluding_curated()
     {
-        var repo = Substitute.For<IMarketPriceHistoryRepository>();
-        repo.GetByProductNameAsync("Camera IP", Arg.Any<int>(), Arg.Any<CancellationToken>())
-            .Returns([
+        var repo = new Mock<IMarketPriceHistoryRepository>();
+        repo.Setup(r => r.GetByProductNameAsync("Camera IP", It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync([
                 MarketPriceHistory.Create("Camera IP", 180m, "WebScrape:Aggregated", DateTime.UtcNow.AddDays(-3)),
                 MarketPriceHistory.Create("Camera IP", 200m, "WebScrape:Aggregated", DateTime.UtcNow.AddDays(-1)),
                 MarketPriceHistory.Create("Camera IP", 185m, "CuratedCategoryBenchmark:camera", DateTime.UtcNow),
             ]);
 
         var result = await HistoricalPriceBenchmarkResolver.TryResolveAsync(
-            repo,
+            repo.Object,
             ["Camera IP"],
             190m,
             CancellationToken.None);
