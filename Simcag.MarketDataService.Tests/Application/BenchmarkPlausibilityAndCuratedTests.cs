@@ -1,4 +1,7 @@
 using Simcag.MarketDataService.Application.Benchmarking;
+using Simcag.MarketDataService.Application.Interfaces;
+using Simcag.MarketDataService.Domain.Entities;
+using NSubstitute;
 
 namespace Simcag.MarketDataService.Tests.Application;
 
@@ -15,34 +18,58 @@ public sealed class DeclaredReferencePlausibilityTests
     [InlineData(4.93, 3500, false)]
     [InlineData(185, 890, true)]
     [InlineData(2000, 3500, true)]
+    [InlineData(694, 4200, false)]
+    [InlineData(554, 4200, false)]
+    [InlineData(2200, 4200, true)]
     public void IsPlausible_valida_faixa(decimal candidate, decimal declared, bool expected) =>
         Assert.Equal(expected, DeclaredReferencePlausibility.IsPlausible(candidate, declared));
+
+    [Fact]
+    public void FilterSamples_high_value_rejeita_produtos_baratos_incompativeis()
+    {
+        var filtered = DeclaredReferencePlausibility.FilterSamples([554m, 694m, 499m, 2200m], 4200m);
+        Assert.Equal([2200m], filtered);
+    }
+
+    [Fact]
+    public void ResolveMinRatio_escala_com_valor_declarado()
+    {
+        Assert.Equal(0.05m, DeclaredReferencePlausibility.ResolveMinRatio(100m));
+        Assert.Equal(0.15m, DeclaredReferencePlausibility.ResolveMinRatio(890m));
+        Assert.Equal(0.20m, DeclaredReferencePlausibility.ResolveMinRatio(4200m));
+    }
+
+    [Fact]
+    public void FilterSamplesTightBand_remove_outliers_espurios()
+    {
+        var declared = 890m;
+        var samples = new[] { 89m, 185m, 750m, 890m, 1200m, 3500m };
+        var filtered = DeclaredReferencePlausibility.FilterSamplesTightBand(samples, declared);
+        Assert.Equal([750m, 890m, 1200m], filtered);
+    }
 }
 
-public sealed class CuratedCategoryBenchmarkCatalogTests
+public sealed class HistoricalPriceBenchmarkResolverTests
 {
     [Fact]
-    public void TryMatch_material_manutencao_predial()
+    public async Task TryResolveAsync_uses_median_of_history_excluding_curated()
     {
-        var match = CuratedCategoryBenchmarkCatalog.TryMatch("Material de manutenção predial", 3500m);
-        Assert.NotNull(match);
-        Assert.Equal("manutencao_predial", match!.PatternId);
-        Assert.Equal(2000m, match.ReferencePriceBrl);
-    }
+        var repo = Substitute.For<IMarketPriceHistoryRepository>();
+        repo.GetByProductNameAsync("Camera IP", Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns([
+                MarketPriceHistory.Create("Camera IP", 180m, "WebScrape:Aggregated", DateTime.UtcNow.AddDays(-3)),
+                MarketPriceHistory.Create("Camera IP", 200m, "WebScrape:Aggregated", DateTime.UtcNow.AddDays(-1)),
+                MarketPriceHistory.Create("Camera IP", 185m, "CuratedCategoryBenchmark:camera", DateTime.UtcNow),
+            ]);
 
-    [Fact]
-    public void TryMatch_camera_ip_full_hd()
-    {
-        var match = CuratedCategoryBenchmarkCatalog.TryMatch("Camera IP Full HD 2MP", 890m);
-        Assert.NotNull(match);
-        Assert.Equal("camera_ip_2mp", match!.PatternId);
-        Assert.Equal(185m, match.ReferencePriceBrl);
-    }
+        var result = await HistoricalPriceBenchmarkResolver.TryResolveAsync(
+            repo,
+            ["Camera IP"],
+            190m,
+            CancellationToken.None);
 
-    [Fact]
-    public void TryMatch_rejeita_curado_incompativel_com_declarado()
-    {
-        var match = CuratedCategoryBenchmarkCatalog.TryMatch("Camera IP Full HD 2MP", 15m);
-        Assert.Null(match);
+        Assert.NotNull(result);
+        Assert.Equal(200m, result!.Price);
+        Assert.Equal(HistoricalPriceBenchmarkResolver.SourcePrefix, result.Source);
     }
 }

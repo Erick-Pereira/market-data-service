@@ -13,6 +13,18 @@ public sealed class StoredMarketPricePolicyTests
     }
 
     [Fact]
+    public void ShouldNotRefresh_WhenDocumentAnchorMatchesDeclared()
+    {
+        var stored = MarketPrice.CreateObservation(
+            "Automacao predial",
+            1_500_000m,
+            "DocumentDeclaredReference",
+            "Outros",
+            "BR-Nacional");
+        Assert.False(StoredMarketPricePolicy.ShouldRefresh(1_500_000m, stored));
+    }
+
+    [Fact]
     public void ShouldRefresh_WhenDeclaredDiffersMoreThan40Percent()
     {
         var stored = MarketPrice.CreateObservation("Camera IP", 100m, "WebScrape:Aggregated", "Outros", "BR-Nacional");

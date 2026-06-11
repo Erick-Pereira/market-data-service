@@ -49,25 +49,58 @@ public sealed class SearxngStartupHostedService : IHostedService
         var baseUrl = _opt.SearxngBaseUrl!.Trim().TrimEnd('/');
         try
         {
-            using var cts = new CancellationTokenSource(
-                TimeSpan.FromSeconds(Math.Max(2, _opt.SearxngConnectTimeoutSeconds + 1)));
             var client = _httpFactory.CreateClient(MarketDataHttpClients.Searxng);
-            using var resp = await client.GetAsync(baseUrl + "/", cts.Token).ConfigureAwait(false);
-            if (resp.IsSuccessStatusCode)
+            using var rootCts = new CancellationTokenSource(
+                TimeSpan.FromSeconds(Math.Max(3, _opt.SearxngConnectTimeoutSeconds + 2)));
+            using var resp = await client.GetAsync(baseUrl + "/", rootCts.Token).ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode)
             {
-                _gate.MarkAvailable();
-                _log.LogInformation("SearXNG acessível em {BaseUrl}", baseUrl);
+                MarkUnavailableAndWarn(baseUrl, $"HTTP {(int)resp.StatusCode}");
                 return;
             }
 
-            MarkUnavailableAndWarn(baseUrl, $"HTTP {(int)resp.StatusCode}");
+            _gate.MarkAvailable();
+
+            var searchUrl = baseUrl + "/search?q=ping&format=json&language=pt-BR";
+            using var searchCts = new CancellationTokenSource(
+                TimeSpan.FromSeconds(Math.Max(10, _opt.SearxngSearchTimeoutSeconds)));
+            try
+            {
+                using var searchResp = await client.GetAsync(searchUrl, searchCts.Token).ConfigureAwait(false);
+                if (searchResp.IsSuccessStatusCode)
+                {
+                    _log.LogInformation("SearXNG acessível em {BaseUrl} (JSON /search OK)", baseUrl);
+                    return;
+                }
+
+                if (searchResp.StatusCode == System.Net.HttpStatusCode.Forbidden)
+                {
+                    _gate.MarkUnavailable(TimeSpan.FromMinutes(Math.Max(1, _opt.SearxngUnavailableCooldownMinutes)));
+                }
+
+                _log.LogWarning(
+                    "SearXNG responde em {BaseUrl}/ mas /search retorna HTTP {(Status)}. " +
+                    "No host: SEARXNG_LIMITER=false ou limiter.toml com pass_ip/trusted_proxies; " +
+                    "MARKET_DATA__SEARXNG_CLIENT_IP numa faixa pass_ip (ex. 10.0.0.1).",
+                    baseUrl,
+                    (int)searchResp.StatusCode);
+            }
+            catch (OperationCanceledException)
+            {
+                // /search lento no 1º pedido não deve abrir circuit breaker — SearXNG está de pé.
+                _log.LogWarning(
+                    "SearXNG /search timeout no probe ({Timeout}s) em {BaseUrl}; provider mantido activo.",
+                    _opt.SearxngSearchTimeoutSeconds,
+                    baseUrl);
+            }
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
+        {
+            MarkUnavailableAndWarn(baseUrl, "timeout de ligação (container provavelmente parado)");
         }
         catch (Exception ex)
         {
-            var reason = ex is OperationCanceledException or TimeoutException
-                ? "timeout de ligação (container provavelmente parado)"
-                : ex.GetType().Name;
-            MarkUnavailableAndWarn(baseUrl, reason);
+            MarkUnavailableAndWarn(baseUrl, ex.GetType().Name);
         }
     }
 

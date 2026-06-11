@@ -8,6 +8,7 @@ using Simcag.MarketDataService.Application.DTOs;
 using Simcag.MarketDataService.Application.Interfaces;
 using Simcag.MarketDataService.Domain.Entities;
 using Simcag.MarketDataService.Domain.ValueObjects;
+using Simcag.Shared.Contracts;
 
 namespace Simcag.MarketDataService.Application.Services;
 
@@ -72,7 +73,8 @@ public class MarketDataService : IMarketDataService
         var normalizedLabel = ProductNameNormalizer.Normalize(trimmed);
 
         var cachedPrice = await _cacheService.GetMarketPriceAsync(trimmed, ct);
-        if (cachedPrice != null)
+        if (cachedPrice != null
+            && IsCachedPriceUsable(cachedPrice.Price, declaredReferenceBrl, trimmed, "redis-cache"))
         {
             return new MarketPriceResolution(
                 cachedPrice,
@@ -98,11 +100,17 @@ public class MarketDataService : IMarketDataService
             if (fromDb is null)
                 continue;
 
+            if (StoredMarketPricePolicy.IsCuratedCategorySource(fromDb.Source))
+                continue;
+
             if (StoredMarketPricePolicy.IsExternalBenchmarkSource(fromDb.Source))
                 staleExternalCandidate ??= fromDb;
 
             if (!StoredMarketPricePolicy.ShouldRefresh(declaredReferenceBrl, fromDb))
             {
+                if (!IsCachedPriceUsable(fromDb.Price, declaredReferenceBrl, searchName, "postgresql"))
+                    continue;
+
                 var result = MarketPrice.Create(fromDb.ProductName, Math.Round(fromDb.Price, 2), "PostgreSQL");
                 await _cacheService.SetMarketPriceAsync(result, ct);
                 return new MarketPriceResolution(
@@ -125,23 +133,36 @@ public class MarketDataService : IMarketDataService
 
         MarketPriceResearchDetailedOutcome? lastWeb = null;
         MarketPriceResearchResult? researched = null;
-        foreach (var query in searchNames)
+        try
         {
-            lastWeb = await _research.TryResolvePriceDetailedAsync(query, declaredReferenceBrl, ct);
-            if (lastWeb.Result is not null)
+            foreach (var query in searchNames)
             {
-                researched = lastWeb.Result;
-                break;
+                lastWeb = await _research.TryResolvePriceDetailedAsync(query, declaredReferenceBrl, ct);
+                if (lastWeb.Result is not null)
+                {
+                    researched = lastWeb.Result;
+                    break;
+                }
             }
         }
-
-        if (researched is null && _researchOptions.EnableCuratedCategoryBenchmark)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            researched = TryCuratedCategoryBenchmark(trimmed, declaredReferenceBrl);
+            _logger.LogWarning(
+                "Pesquisa web interrompida por budget/tempo para {ProductName}; aplicando fallback.",
+                productName);
+        }
+
+        if (researched is null)
+        {
+            researched = await HistoricalPriceBenchmarkResolver.TryResolveAsync(
+                _historyRepository,
+                searchNames,
+                declaredReferenceBrl,
+                ct);
             if (researched is not null)
             {
                 _logger.LogInformation(
-                    "Benchmark curado para {ProductName}: {Price:C} ({Source})",
+                    "Benchmark histórico (PostgreSQL) para {ProductName}: {Price:C} ({Source})",
                     productName,
                     researched.Price,
                     researched.Source);
@@ -252,7 +273,8 @@ public class MarketDataService : IMarketDataService
             researched.Diagnostics,
             researched.BenchmarkKind == BenchmarkPriceKind.DocumentAnchorPrice
                 ? lastWeb?.RejectionReasons
-                : null);
+                : null,
+            researched.MarketSamples);
     }
 
     /// <summary>
@@ -347,33 +369,25 @@ public class MarketDataService : IMarketDataService
         return "low";
     }
 
-    private static MarketPriceResearchResult? TryCuratedCategoryBenchmark(
+    private bool IsCachedPriceUsable(
+        decimal cachedPrice,
+        decimal? declaredReferenceBrl,
         string productName,
-        decimal? declaredReferenceBrl)
+        string layer)
     {
-        var match = CuratedCategoryBenchmarkCatalog.TryMatch(productName, declaredReferenceBrl);
-        if (match is null)
-            return null;
+        if (declaredReferenceBrl is not > 0.01m)
+            return true;
 
-        return new MarketPriceResearchResult(
-            Math.Round(match.ReferencePriceBrl, 2),
-            $"{CuratedCategoryBenchmarkCatalog.SourcePrefix}:{match.PatternId}",
-            match.EvidenceSnippet,
-            1,
-            0,
-            null,
-            BenchmarkPriceKind.ExternalMarketEstimate,
-            BenchmarkStatuses.DatabaseHit,
-            0.45m,
-            0.40m,
-            new[]
-            {
-                new BenchmarkDiagnosticEntry(
-                    "curated_catalog",
-                    "pattern_match",
-                    match.PatternId,
-                    match.Category)
-            });
+        if (DeclaredReferencePlausibility.IsPlausible(cachedPrice, declaredReferenceBrl.Value))
+            return true;
+
+        _logger.LogInformation(
+            "Cache {Layer} ignorado para {ProductName}: {CachedPrice} incompatível com declarado {Declared}",
+            layer,
+            productName,
+            cachedPrice,
+            declaredReferenceBrl);
+        return false;
     }
 
     private async Task PersistMarketObservationAsync(

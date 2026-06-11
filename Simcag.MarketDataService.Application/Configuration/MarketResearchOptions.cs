@@ -19,16 +19,16 @@ public sealed class MarketResearchOptions
     public int SearxngUnavailableCooldownMinutes { get; set; } = 5;
 
     /// <summary>Timeout de ligação TCP ao SearXNG local (segundos).</summary>
-    public int SearxngConnectTimeoutSeconds { get; set; } = 2;
+    public int SearxngConnectTimeoutSeconds { get; set; } = 5;
+
+    /// <summary>Timeout de pedidos /search (SearXNG agrega motores — 1º pedido pode levar 10–20s).</summary>
+    public int SearxngSearchTimeoutSeconds { get; set; } = 20;
 
     /// <summary>Chave SerpAPI — só usada se <see cref="EnableSerpApiFallback"/> estiver ativo.</summary>
     public string? SerpApiKey { get; set; }
 
     /// <summary>Fallback pago SerpAPI — requer MARKET_DATA__ENABLE_SERPAPI=true e chave configurada.</summary>
     public bool EnableSerpApiFallback { get; set; }
-
-    /// <summary>Benchmarks curados por categoria (sem API externa) quando web falha ou é implausível.</summary>
-    public bool EnableCuratedCategoryBenchmark { get; set; } = true;
 
     /// <summary>
     /// DuckDuckGo lite (HTML): extrai texto dos resultados e interpreta valores em BRL.
@@ -74,4 +74,10 @@ public sealed class MarketResearchOptions
     /// (reduz falsos positivos de um único valor espúrio). SerpAPI shopping não é afetado.
     /// </summary>
     public bool RequireDistinctSamplesForWebScrape { get; set; }
+
+    /// <summary>
+    /// Tempo máximo (segundos) para pesquisa web num pedido RPC get-price antes de fallback
+    /// (histórico PostgreSQL / stale / âncora documental). Deve ser &lt; MARKET_DATA_RPC_TIMEOUT_SECONDS.
+    /// </summary>
+    public int RpcResearchBudgetSeconds { get; set; } = 45;
 }

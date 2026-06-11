@@ -1,4 +1,5 @@
 using Simcag.MarketDataService.Application.Benchmarking;
+using Simcag.Shared.Contracts;
 
 namespace Simcag.MarketDataService.Application.Interfaces;
 
@@ -46,4 +47,5 @@ public sealed record MarketPriceResearchResult(
     string BenchmarkStatus = BenchmarkStatuses.ResolvedExternal,
     decimal? ConfidenceScore = null,
     decimal? BenchmarkQualityScore = null,
-    IReadOnlyList<BenchmarkDiagnosticEntry>? Diagnostics = null);
+    IReadOnlyList<BenchmarkDiagnosticEntry>? Diagnostics = null,
+    IReadOnlyList<MarketPriceSample>? MarketSamples = null);

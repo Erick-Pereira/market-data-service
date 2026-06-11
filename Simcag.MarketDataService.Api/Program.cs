@@ -90,7 +90,7 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
-    c.SwaggerDoc("v1", new Microsoft.OpenApi.OpenApiInfo { Title = "SIMC-AG Service", Version = "v1" });
+    c.SwaggerDoc("v1", new Microsoft.OpenApi.OpenApiInfo { Title = "Econdomiza - Market Data", Version = "v1" });
     c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.OpenApiSecurityScheme
     {
         Name = "Authorization",
@@ -181,9 +181,6 @@ builder.Services.Configure<MarketResearchOptions>(o =>
     o.EnableSearxngScrape = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_SEARXNG_SCRAPE"), defaultValue: true);
     o.SerpApiKey = GetEnv("MARKET_DATA__SERPAPI_API_KEY", "SERPAPI_API_KEY");
     o.EnableSerpApiFallback = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_SERPAPI"), defaultValue: false);
-    o.EnableCuratedCategoryBenchmark = ParseBoolEnv(
-        GetEnv("MARKET_DATA__ENABLE_CURATED_BENCHMARK"),
-        defaultValue: true);
     o.EnableDuckDuckGoLiteScrape = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_DDG_LITE_SCRAPE"), defaultValue: true);
     o.EnableBingHtmlScrape = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_BING_HTML_SCRAPE"), defaultValue: true);
     o.EnableBingRssScrape = ParseBoolEnv(GetEnv("MARKET_DATA__ENABLE_BING_RSS_SCRAPE"), defaultValue: true);
@@ -200,8 +197,12 @@ builder.Services.Configure<MarketResearchOptions>(o =>
         defaultValue: false);
     if (int.TryParse(GetEnv("MARKET_DATA__SEARXNG_CONNECT_TIMEOUT_SECONDS"), out var sct) && sct > 0)
         o.SearxngConnectTimeoutSeconds = sct;
+    if (int.TryParse(GetEnv("MARKET_DATA__SEARXNG_SEARCH_TIMEOUT_SECONDS"), out var sst) && sst >= 5)
+        o.SearxngSearchTimeoutSeconds = sst;
     if (int.TryParse(GetEnv("MARKET_DATA__SEARXNG_COOLDOWN_MINUTES"), out var scm) && scm >= 1)
         o.SearxngUnavailableCooldownMinutes = scm;
+    if (int.TryParse(GetEnv("MARKET_DATA__RPC_RESEARCH_BUDGET_SECONDS"), out var rpcBudget) && rpcBudget >= 5)
+        o.RpcResearchBudgetSeconds = rpcBudget;
 });
 
 builder.Services.AddHttpClient(MarketDataHttpClients.Serp)
@@ -234,14 +235,27 @@ builder.Services.AddHttpClient(MarketDataHttpClients.Searxng)
     .ConfigureHttpClient((sp, client) =>
     {
         var o = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<MarketResearchOptions>>().Value;
-        client.Timeout = TimeSpan.FromSeconds(Math.Max(3, o.SearxngConnectTimeoutSeconds + 3));
+        client.Timeout = TimeSpan.FromSeconds(Math.Max(10, o.SearxngSearchTimeoutSeconds + 5));
         client.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
         client.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "pt-BR,pt;q=0.9");
+        client.DefaultRequestHeaders.TryAddWithoutValidation(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        if (!string.IsNullOrWhiteSpace(o.SearxngBaseUrl))
+        {
+            client.DefaultRequestHeaders.TryAddWithoutValidation(
+                "Referer",
+                o.SearxngBaseUrl.Trim().TrimEnd('/') + "/");
+        }
+
+        // SearXNG bot detection exige IP do cliente (log: "X-Forwarded-For nor X-Real-IP header is set").
+        var clientIp = GetEnv("MARKET_DATA__SEARXNG_CLIENT_IP") ?? "127.0.0.1";
+        client.DefaultRequestHeaders.TryAddWithoutValidation("X-Forwarded-For", clientIp);
+        client.DefaultRequestHeaders.TryAddWithoutValidation("X-Real-IP", clientIp);
     });
 
 builder.Services.AddSingleton<SearxngAvailabilityGate>();
 builder.Services.AddHostedService<SearxngStartupHostedService>();
-builder.Services.AddHostedService<CuratedBenchmarkSeedHostedService>();
 builder.Services.AddScoped<SearxngMarketPriceProvider>();
 builder.Services.AddScoped<DdgLiteMarketPriceProvider>();
 builder.Services.AddScoped<DdgHtmlMarketPriceProvider>();
@@ -275,11 +289,19 @@ if (!isTesting)
         async (sp, request, ct) =>
         {
             var marketData = sp.GetRequiredService<IMarketDataService>();
+            var researchOpts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<MarketResearchOptions>>().Value;
+            var searxngBaseUrl = researchOpts.SearxngBaseUrl;
             var name = request.ProductName?.Trim();
             if (string.IsNullOrWhiteSpace(name))
                 return new GetMarketPriceRpcResponse { Found = false };
 
-            var resolution = await marketData.ResolvePriceAsync(name, ct, request.DeclaredReferenceBrl);
+            using var budgetCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            if (researchOpts.RpcResearchBudgetSeconds > 0)
+            {
+                budgetCts.CancelAfter(TimeSpan.FromSeconds(researchOpts.RpcResearchBudgetSeconds));
+            }
+
+            var resolution = await marketData.ResolvePriceAsync(name, budgetCts.Token, request.DeclaredReferenceBrl);
             if (resolution is null)
                 return new GetMarketPriceRpcResponse { Found = false };
 
@@ -292,6 +314,37 @@ if (!isTesting)
                 Source = quote.Source,
                 BenchmarkKind = resolution.BenchmarkKind.ToString(),
                 BenchmarkStatus = resolution.BenchmarkStatus,
+                Confidence = resolution.Confidence,
+                SampleCount = resolution.SampleCount,
+                RelativeSpread = resolution.RelativeSpread,
+                SearchQueryUsed = resolution.SearchQueryUsed,
+                CollectedDate = quote.CollectedDate,
+                BenchmarkRejectionTrail = resolution.BenchmarkRejectionTrail,
+                BenchmarkDiagnostics = resolution.BenchmarkDiagnostics?
+                    .Select(d => new MarketPriceEvidenceRpcDto
+                    {
+                        Scope = d.Scope,
+                        Phase = d.Phase,
+                        Message = d.Message,
+                        Detail = d.Detail,
+                    })
+                    .ToList(),
+                ReferenceLinks = MarketReferenceLinkBuilder
+                    .Build(
+                        resolution.SearchQueryUsed,
+                        resolution.BenchmarkDiagnostics,
+                        searxngBaseUrl)
+                    .Select(l => new MarketPriceReferenceLinkRpcDto { Label = l.Label, Url = l.Url })
+                    .ToList(),
+                MarketSamples = resolution.MarketSamples?
+                    .Select(s => new MarketPriceSampleRpcDto
+                    {
+                        Label = s.Label,
+                        Url = s.Url,
+                        PriceBrl = s.PriceBrl,
+                        Provider = s.Provider,
+                    })
+                    .ToList(),
             };
         });
 }

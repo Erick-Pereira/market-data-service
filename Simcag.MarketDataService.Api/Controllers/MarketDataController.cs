@@ -1,4 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
+using Simcag.MarketDataService.Application.Benchmarking;
+using Simcag.MarketDataService.Application.Configuration;
 using Simcag.MarketDataService.Application.Interfaces;
 using Simcag.Shared.Contracts;
 using System;
@@ -15,8 +18,15 @@ namespace Simcag.MarketDataService.Api.Controllers;
 public class MarketDataController : ControllerBase
 {
     private readonly IMarketDataService _marketDataService;
+    private readonly MarketResearchOptions _researchOptions;
 
-    public MarketDataController(IMarketDataService marketDataService) => _marketDataService = marketDataService;
+    public MarketDataController(
+        IMarketDataService marketDataService,
+        IOptions<MarketResearchOptions> researchOptions)
+    {
+        _marketDataService = marketDataService;
+        _researchOptions = researchOptions.Value;
+    }
 
     [HttpGet("price")]
     public async Task<IActionResult> GetPrice(
@@ -57,7 +67,11 @@ public class MarketDataController : ControllerBase
             resolution.ConfidenceScore,
             resolution.BenchmarkQualityScore,
             resolution.BenchmarkDiagnostics,
-            resolution.BenchmarkRejectionTrail
+            resolution.BenchmarkRejectionTrail,
+            referenceLinks = MarketReferenceLinkBuilder
+                .Build(resolution.SearchQueryUsed, resolution.BenchmarkDiagnostics, _researchOptions.SearxngBaseUrl)
+                .Select(l => new { l.Label, l.Url })
+                .ToList(),
         };
 
         return Ok(ApiResponse<object>.Ok(result!));

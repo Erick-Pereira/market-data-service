@@ -1,5 +1,6 @@
 using Simcag.MarketDataService.Application.Benchmarking;
 using Simcag.MarketDataService.Domain.Entities;
+using Simcag.Shared.Contracts;
 
 namespace Simcag.MarketDataService.Application.DTOs;
 
@@ -16,4 +17,5 @@ public sealed record MarketPriceResolution(
     decimal? ConfidenceScore = null,
     decimal? BenchmarkQualityScore = null,
     IReadOnlyList<BenchmarkDiagnosticEntry>? BenchmarkDiagnostics = null,
-    IReadOnlyList<string>? BenchmarkRejectionTrail = null);
+    IReadOnlyList<string>? BenchmarkRejectionTrail = null,
+    IReadOnlyList<MarketPriceSample>? MarketSamples = null);

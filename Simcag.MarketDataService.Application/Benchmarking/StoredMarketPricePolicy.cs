@@ -11,8 +11,21 @@ public static class StoredMarketPricePolicy
 
     public static bool ShouldRefresh(decimal? declaredReferenceBrl, MarketPrice stored)
     {
-        if (IsDocumentAnchorSource(stored.Source))
+        if (IsCuratedCategorySource(stored.Source))
             return true;
+
+        if (IsDocumentAnchorSource(stored.Source))
+        {
+            if (declaredReferenceBrl is not > 0.01m)
+                return false;
+
+            var anchorDelta = Math.Abs(declaredReferenceBrl.Value - stored.Price);
+            var anchorBase = Math.Min(declaredReferenceBrl.Value, stored.Price);
+            if (anchorBase > 0.01m && anchorDelta / anchorBase <= MaxDeclaredVsStoredRelativeDelta)
+                return false;
+
+            return true;
+        }
 
         if (declaredReferenceBrl is not > 0.01m)
             return false;

@@ -4,6 +4,7 @@ using Simcag.MarketDataService.Application;
 using Simcag.MarketDataService.Application.Benchmarking;
 using Simcag.MarketDataService.Application.Configuration;
 using Simcag.MarketDataService.Application.Services;
+using Simcag.Shared.Contracts;
 using Simcag.Shared.Telemetry;
 
 namespace Simcag.MarketDataService.Application.Benchmarking.Providers;
@@ -23,7 +24,8 @@ public sealed record ProviderSampleBatch(
     HttpStatusCode? HttpStatus,
     string Outcome,
     string? Detail,
-    bool AntiBotLikely);
+    bool AntiBotLikely,
+    IReadOnlyList<MarketPriceSample>? Citations = null);
 
 public sealed class SearxngMarketPriceProvider : IMarketPriceSampleProvider
 {
@@ -69,10 +71,18 @@ public sealed class SearxngMarketPriceProvider : IMarketPriceSampleProvider
             client, url, _opt, ProviderId, _log, ct, maxRetriesOverride: 0);
         if (outcome != "ok" || string.IsNullOrEmpty(body))
         {
-            if (outcome == "connection_refused")
+            if (outcome == "connection_refused"
+                || status is HttpStatusCode.Forbidden or HttpStatusCode.TooManyRequests)
             {
                 _gate.MarkUnavailable(TimeSpan.FromMinutes(Math.Max(1, _opt.SearxngUnavailableCooldownMinutes)));
-                if (_gate.TryLogStartupWarningOnce())
+                if (status is HttpStatusCode.Forbidden)
+                {
+                    _log.LogWarning(
+                        "SearXNG /search HTTP 403 em {BaseUrl} (bot detection). " +
+                        "No host: monte docker/searxng com limiter.toml e SEARXNG_LIMITER=false.",
+                        baseUrl);
+                }
+                else if (_gate.TryLogStartupWarningOnce())
                 {
                     _log.LogWarning(
                         "SearXNG indisponível em {BaseUrl}. Pesquisa continua via DDG/Bing. Suba: docker compose -f docker-compose.dev.yml up -d searxng",
@@ -90,10 +100,13 @@ public sealed class SearxngMarketPriceProvider : IMarketPriceSampleProvider
         }
 
         _gate.MarkAvailable();
+        var topLinks = SearxngJsonParser.ExtractTopResults(body, 5);
         var text = SearxngJsonParser.ExtractResultText(body);
-        var samples = BrazilianMoneyParser.ExtractAll(text);
+        var samples = BrazilianMoneyParser.ExtractListingPrices(text);
+        var citations = SearxngJsonParser.ExtractResultPriceSamples(body, 5);
+        var topResultsDetail = SearxngJsonParser.FormatTopResultsDetail(topLinks);
         return new ProviderSampleBatch(ProviderId, samples, status, samples.Count > 0 ? "ok" : "parse_empty",
-            null, false);
+            topResultsDetail, false, citations);
     }
 }
 
@@ -145,7 +158,7 @@ public sealed class DdgLiteMarketPriceProvider : IMarketPriceSampleProvider
         }
 
         var text = HtmlSnippetExtractors.DuckDuckGoLite(html, _log);
-        var samples = BrazilianMoneyParser.ExtractAll(text);
+        var samples = BrazilianMoneyParser.ExtractListingPrices(text);
         return new ProviderSampleBatch(ProviderId, samples, status, samples.Count > 0 ? "ok" : "parse_empty",
             null, false);
     }
@@ -199,7 +212,7 @@ public sealed class DdgHtmlMarketPriceProvider : IMarketPriceSampleProvider
         }
 
         var text = HtmlSnippetExtractors.DuckDuckGoHtml(html, _log);
-        var samples = BrazilianMoneyParser.ExtractAll(text);
+        var samples = BrazilianMoneyParser.ExtractListingPrices(text);
         return new ProviderSampleBatch(ProviderId, samples, status, samples.Count > 0 ? "ok" : "parse_empty",
             null, false);
     }
@@ -256,7 +269,7 @@ public sealed class BingHtmlMarketPriceProvider : IMarketPriceSampleProvider
         var text = HtmlSnippetExtractors.BingOrganicSnippets(html, _log);
         if (string.IsNullOrWhiteSpace(text))
             text = HtmlSnippetExtractors.BingResultsFallbackText(html, _log);
-        var samples = string.IsNullOrWhiteSpace(text) ? Array.Empty<decimal>() : BrazilianMoneyParser.ExtractAll(text);
+        var samples = string.IsNullOrWhiteSpace(text) ? Array.Empty<decimal>() : BrazilianMoneyParser.ExtractListingPrices(text);
         return new ProviderSampleBatch(ProviderId, samples, status, samples.Count > 0 ? "ok" : "parse_empty",
             null, false);
     }
@@ -302,7 +315,7 @@ public sealed class BingRssMarketPriceProvider : IMarketPriceSampleProvider
         }
 
         var text = RssSnippetExtractor.ExtractItemDescriptions(xml);
-        var samples = BrazilianMoneyParser.ExtractAll(text);
+        var samples = BrazilianMoneyParser.ExtractListingPrices(text);
         return new ProviderSampleBatch(ProviderId, samples, status, samples.Count > 0 ? "ok" : "parse_empty",
             null, false);
     }

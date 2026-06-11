@@ -8,6 +8,7 @@ using Simcag.MarketDataService.Application.Benchmarking;
 using Simcag.MarketDataService.Application.Benchmarking.Providers;
 using Simcag.MarketDataService.Application.Configuration;
 using Simcag.MarketDataService.Application.Interfaces;
+using Simcag.Shared.Contracts;
 using Simcag.Shared.Telemetry;
 
 namespace Simcag.MarketDataService.Application.Services;
@@ -81,7 +82,7 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         foreach (var candidate in queries)
         {
             q = candidate;
-            batches = await Task.WhenAll(_sampleProviders.Select(p => p.FetchSamplesAsync(q, cancellationToken)));
+            batches = await FetchProviderBatchesAsync(q, declaredReferenceBrl, cancellationToken);
             var rawMerged = batches.SelectMany(b => b.Samples).ToList();
             merged = DeclaredReferencePlausibility.FilterSamples(rawMerged, declaredReferenceBrl).ToList();
             if (rawMerged.Count > 0 && merged.Count == 0)
@@ -111,6 +112,7 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
 
         if (merged.Count > 0)
         {
+            var marketSamples = CollectMarketSamples(batches, declaredReferenceBrl);
             var fromAgg = BuildFromExtracted(
                 merged,
                 "WebScrape:Aggregated(SearXNG+BingRSS+DDG+Bing)",
@@ -118,7 +120,9 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
                 q,
                 structuredPriceList: false,
                 antiBotLikely: antiBot,
-                rejections);
+                rejections,
+                declaredReferenceBrl,
+                marketSamples);
             if (fromAgg is not null
                 && declaredReferenceBrl is > 0.01m
                 && !DeclaredReferencePlausibility.IsPlausible(fromAgg.Price, declaredReferenceBrl.Value))
@@ -181,6 +185,90 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         return new MarketPriceResearchDetailedOutcome(null, rejections, diagnostics);
     }
 
+    /// <summary>
+    /// Dispara providers em paralelo e cancela pendentes quando já há amostras plausíveis suficientes
+    /// (evita esperar timeout de DDG quando SearXNG/Bing já responderam).
+    /// </summary>
+    private async Task<ProviderSampleBatch[]> FetchProviderBatchesAsync(
+        string searchQuery,
+        decimal? declaredReferenceBrl,
+        CancellationToken cancellationToken)
+    {
+        var enabled = _sampleProviders.Where(p => p.IsEnabled(_opt)).ToArray();
+        if (enabled.Length == 0)
+            return Array.Empty<ProviderSampleBatch>();
+
+        var minNeeded = _opt.RequireDistinctSamplesForWebScrape
+            ? Math.Max(2, _opt.MinimumPriceSamplesForWebScrape)
+            : Math.Max(1, _opt.MinimumPriceSamplesForWebScrape);
+
+        using var fetchCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var tasks = enabled
+            .Select(p => FetchProviderBatchSafeAsync(p, searchQuery, fetchCts.Token))
+            .ToList();
+        var batches = new List<ProviderSampleBatch>();
+        var completedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        while (tasks.Count > 0)
+        {
+            var finished = await Task.WhenAny(tasks).ConfigureAwait(false);
+            tasks.Remove(finished);
+            var batch = await finished.ConfigureAwait(false);
+            batches.Add(batch);
+            completedIds.Add(batch.ProviderId);
+
+            var plausible = DeclaredReferencePlausibility.FilterSamples(
+                batches.SelectMany(b => b.Samples).ToList(),
+                declaredReferenceBrl);
+
+            if (plausible.Count >= minNeeded)
+            {
+                fetchCts.Cancel();
+                _log.LogInformation(
+                    "Pesquisa web: {Count} amostra(s) plausível(eis) após {Provider}; providers pendentes cancelados.",
+                    plausible.Count,
+                    batch.ProviderId);
+                break;
+            }
+        }
+
+        foreach (var provider in enabled)
+        {
+            if (completedIds.Contains(provider.ProviderId))
+                continue;
+            batches.Add(new ProviderSampleBatch(
+                provider.ProviderId,
+                Array.Empty<decimal>(),
+                null,
+                "skipped_after_sufficient_samples",
+                null,
+                false));
+        }
+
+        return batches.ToArray();
+    }
+
+    private static async Task<ProviderSampleBatch> FetchProviderBatchSafeAsync(
+        IMarketPriceSampleProvider provider,
+        string searchQuery,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await provider.FetchSamplesAsync(searchQuery, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return new ProviderSampleBatch(
+                provider.ProviderId,
+                Array.Empty<decimal>(),
+                null,
+                "cancelled_early",
+                null,
+                false);
+        }
+    }
+
     private void RecordBenchmarkEnd(Stopwatch sw, bool success, string source)
     {
         var elapsed = sw.Elapsed.TotalSeconds;
@@ -193,6 +281,39 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
             SimcagMeters.MarketDataBenchmarkEmpty.Add(1, new KeyValuePair<string, object?>("source", source));
     }
 
+    private static IReadOnlyList<MarketPriceSample> CollectMarketSamples(
+        ProviderSampleBatch[] batches,
+        decimal? declaredReferenceBrl)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var list = new List<MarketPriceSample>();
+
+        foreach (var batch in batches)
+        {
+            if (batch.Citations is not { Count: > 0 })
+                continue;
+
+            foreach (var citation in batch.Citations)
+            {
+                var url = citation.Url?.Trim();
+                if (string.IsNullOrEmpty(url) || !seen.Add(url))
+                    continue;
+
+                if (citation.PriceBrl is > 0m
+                    && declaredReferenceBrl is > 0.01m
+                    && !DeclaredReferencePlausibility.IsPlausible(citation.PriceBrl.Value, declaredReferenceBrl.Value))
+                    continue;
+
+                list.Add(citation);
+            }
+        }
+
+        return list
+            .OrderByDescending(s => s.PriceBrl is > 0m)
+            .ThenBy(s => s.Label, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     private MarketPriceResearchResult? BuildFromExtracted(
         IReadOnlyList<decimal> extracted,
         string source,
@@ -200,7 +321,9 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         string searchQueryUsed,
         bool structuredPriceList,
         bool antiBotLikely,
-        List<string> rejections)
+        List<string> rejections,
+        decimal? declaredReferenceBrl = null,
+        IReadOnlyList<MarketPriceSample>? marketSamples = null)
     {
         var minSamples = structuredPriceList
             ? Math.Max(1, _opt.MinimumPriceSamplesForStructuredList)
@@ -239,17 +362,48 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         var spread = BrazilianMoneyParser.RelativeSpreadAroundMedian(distinctPrices, median.Value);
         if (!structuredPriceList && distinctPrices.Count >= 2 && spread > _opt.MaxRelativeSpreadForWebScrape)
         {
-            rejections.Add(BenchmarkStatuses.RejectedSpread);
-            SimcagMeters.MarketDataBenchmarkRejections.Add(1,
-                new KeyValuePair<string, object?>("reason", "spread"),
-                new KeyValuePair<string, object?>("stage", "web_scrape"));
-            _log.LogInformation(
-                "Cotação web rejeitada por dispersão (spread={Spread:F2} > {Max}, amostras={Count}, fonte={Source})",
-                spread,
-                _opt.MaxRelativeSpreadForWebScrape,
-                distinctPrices.Count,
-                source);
-            return null;
+            if (declaredReferenceBrl is > 0.01m)
+            {
+                var tightened = DeclaredReferencePlausibility
+                    .FilterSamplesTightBand(distinctPrices, declaredReferenceBrl.Value)
+                    .Distinct()
+                    .ToList();
+                if (tightened.Count >= minSamples)
+                {
+                    var tightMedian = BrazilianMoneyParser.Median(tightened);
+                    if (tightMedian is not null)
+                    {
+                        var tightSpread = BrazilianMoneyParser.RelativeSpreadAroundMedian(tightened, tightMedian.Value);
+                        if (tightSpread <= _opt.MaxRelativeSpreadForWebScrape)
+                        {
+                            _log.LogInformation(
+                                "Cotação web aceita após faixa estreita vs declarado (spread={Spread:F2}, amostras={Before}→{After}, mediana={Median:F2})",
+                                tightSpread,
+                                distinctPrices.Count,
+                                tightened.Count,
+                                tightMedian.Value);
+                            distinctPrices = tightened;
+                            median = tightMedian;
+                            spread = tightSpread;
+                        }
+                    }
+                }
+            }
+
+            if (spread > _opt.MaxRelativeSpreadForWebScrape)
+            {
+                rejections.Add(BenchmarkStatuses.RejectedSpread);
+                SimcagMeters.MarketDataBenchmarkRejections.Add(1,
+                    new KeyValuePair<string, object?>("reason", "spread"),
+                    new KeyValuePair<string, object?>("stage", "web_scrape"));
+                _log.LogInformation(
+                    "Cotação web rejeitada por dispersão (spread={Spread:F2} > {Max}, amostras={Count}, fonte={Source})",
+                    spread,
+                    _opt.MaxRelativeSpreadForWebScrape,
+                    distinctPrices.Count,
+                    source);
+                return null;
+            }
         }
 
         var (confidence, quality) = BenchmarkConfidenceCalculator.Compute(
@@ -269,7 +423,8 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
             BenchmarkStatuses.ResolvedExternal,
             confidence,
             quality,
-            Diagnostics: null);
+            Diagnostics: null,
+            MarketSamples: marketSamples);
     }
 
     private async Task<MarketPriceResearchResult?> TrySerpApiAsync(
@@ -370,7 +525,7 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
 
             if (item.TryGetProperty("price", out var priceStr) && priceStr.ValueKind == JsonValueKind.String)
             {
-                foreach (var v in BrazilianMoneyParser.ExtractAll(priceStr.GetString()))
+                foreach (var v in BrazilianMoneyParser.ExtractListingPrices(priceStr.GetString()))
                     amounts.Add(v);
             }
 
@@ -409,7 +564,7 @@ public sealed class OnlineMarketPriceResearchService : IMarketPriceResearchServi
         }
 
         var text = string.Join(" ", chunks.Where(s => !string.IsNullOrEmpty(s)));
-        var extracted = BrazilianMoneyParser.ExtractAll(text);
+        var extracted = BrazilianMoneyParser.ExtractListingPrices(text);
         var ev = text.Length > 280 ? text[..280] : text;
         return BuildFromExtracted(extracted, "SerpApi:GoogleOrganic", ev, searchQueryUsed, structuredPriceList: false,
             antiBotLikely: false, rejections);
